@@ -107,7 +107,7 @@ function parseDate(raw: unknown): string | null {
     jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
     jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
     janv: "01", fevr: "02", mars: "03", avr: "04", mai: "05", juin: "06",
-    juil: "07", aout: "08", sept: "09", oct: "10", nov: "11", dec: "12",
+    juil: "07", aout: "08", sept: "09", oct: "10", nov: "11", déc: "12",
   };
   m = s.match(/^(\d{1,2})\s+([a-zéû]{3,4})\s+(\d{4})$/i);
   if (m) {

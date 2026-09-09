@@ -63,10 +63,25 @@ export function useSync(userId: string | undefined) {
     refreshPending();
   }, [refreshPending]);
 
-  // Keep-alive ping: prevents the Supabase database from pausing due to inactivity.
+  // Re-sync immediately when the tab becomes visible again. While the tab was
+  // hidden, the browser may have paused our interval, so data could be stale.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        sync();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [sync]);
   // Runs every 4 minutes (under the typical 5-minute idle pause threshold).
+  // Also re-pings immediately when the tab becomes visible again, because
+  // browsers throttle setInterval in background tabs — the ping stops firing
+  // while hidden, so the DB connection goes cold and the app feels "paused".
   useEffect(() => {
     const PING_INTERVAL = 4 * 60 * 1000;
+    let interval: ReturnType<typeof setInterval> | null = null;
+
     const ping = async () => {
       if (!navigator.onLine) return;
       try {
@@ -75,9 +90,27 @@ export function useSync(userId: string | undefined) {
         // ignore — the ping is best-effort
       }
     };
+
+    const startInterval = () => {
+      if (interval) clearInterval(interval);
+      interval = setInterval(ping, PING_INTERVAL);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        ping();
+        startInterval();
+      }
+    };
+
     ping();
-    const interval = setInterval(ping, PING_INTERVAL);
-    return () => clearInterval(interval);
+    startInterval();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      if (interval) clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, []);
 
   return { state, sync, refreshPending, genClientUuid };
