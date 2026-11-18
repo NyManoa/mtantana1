@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import {
+  Ban,
   Search,
   Filter,
   Download,
@@ -36,6 +37,8 @@ export interface TransactionRow {
   modifie_le?: string | null;
   synced?: boolean;
   pending_delete?: boolean;
+  ordre_id?: string | null;
+  valide_par_nom?: string | null;
 }
 
 interface Props {
@@ -51,6 +54,8 @@ interface Props {
   onUpdate: (clientUuid: string, data: TransactionFormData) => Promise<void> | void;
   onDelete: (clientUuid: string) => Promise<void> | void;
   onValidate?: (clientUuid: string) => Promise<void> | void;
+  /** Refus motivé (admin) */
+  onRefuse?: (clientUuid: string, motif: string) => Promise<void> | void;
 }
 
 type FilterType = "all" | "miditra" | "mivoaka";
@@ -67,6 +72,7 @@ export function TransactionTable({
   onUpdate,
   onDelete,
   onValidate,
+  onRefuse,
 }: Props) {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<FilterType>("all");
@@ -146,6 +152,20 @@ export function TransactionTable({
   const handleSubmit = async (data: TransactionFormData) => {
     if (editing) await onUpdate(editing.client_uuid, data);
     else await onCreate(data);
+  };
+
+  const handleRefuse = async (row: TransactionRow) => {
+    const motif = window.prompt(t(lang, "refuseTxTitle") + " — " + t(lang, "reason"));
+    if (motif === null) return;
+    if (!motif.trim()) {
+      window.alert(t(lang, "reasonRequired"));
+      return;
+    }
+    try {
+      await onRefuse?.(row.client_uuid, motif);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : t(lang, "error"));
+    }
   };
 
   const handleDelete = async (row: TransactionRow) => {
@@ -295,6 +315,12 @@ export function TransactionTable({
                       ) : (
                         <span className="badge-pending !text-[10px]"><Clock size={10} />{t(lang, "statut_en_attente")}</span>
                       )}
+                      {(row.ordre_id || (row.statut === "validee" && row.valide_par_nom)) && (
+                        <div className="mt-1 text-[10px] leading-tight text-slate-500">
+                          {row.ordre_id && <div>{t(lang, "traceFromOrder")}</div>}
+                          {row.statut === "validee" && row.valide_par_nom && <div>{t(lang, "traceValidatedBy", { who: row.valide_par_nom })}</div>}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-1">
@@ -308,6 +334,16 @@ export function TransactionTable({
                             title={t(lang, "validate")}
                           >
                             <Check size={15} />
+                          </button>
+                        )}
+                        {row.statut === "en_attente_validation" && isAdmin && onRefuse && (
+                          <button
+                            onClick={() => handleRefuse(row)}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400"
+                            title={t(lang, "refuse")}
+                            aria-label={t(lang, "refuse")}
+                          >
+                            <Ban size={15} />
                           </button>
                         )}
                         {canModify(row) ? (

@@ -11,6 +11,9 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { Layout } from "@/components/Layout";
+import { Link } from "react-router-dom";
+import { ClipboardCheck, ChevronRight } from "lucide-react";
+import { useInbox } from "@/lib/inbox";
 import { useAuth } from "@/lib/auth";
 import { useEspace } from "@/lib/espace";
 import { useTransactions } from "@/lib/useTransactions";
@@ -25,6 +28,7 @@ import { CategoryPieChart, type PieSlice } from "@/components/charts/CategoryPie
 export function DashboardPage() {
   const { profile, lang } = useAuth();
   const { role, currentEspace } = useEspace();
+  const inbox = useInbox();
   const { transactions, categories } = useTransactions();
   const version = useDataVersion();
   const [alertes, setAlertes] = useState<LocalAlerte[]>([]);
@@ -127,6 +131,20 @@ export function DashboardPage() {
       title={`${t(lang, "welcomeBack")}, ${profile?.nom ?? ""}`}
       subtitle={isAdmin ? t(lang, "adminView") : t(lang, "superviseurView")}
     >
+      {inbox.taskCount > 0 && (
+        <Link to="/ordres" className="card mb-5 flex items-center gap-3 border-amber-500/30 p-4 transition hover:border-amber-500/60">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-amber-300"><ClipboardCheck size={18} /></div>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold text-white">{t(lang, "tasksPending", { n: inbox.taskCount })}</div>
+            <div className="text-xs text-slate-400">
+              {inbox.toExecute.length > 0 && `${t(lang, "ordersToExecute")} : ${inbox.toExecute.length}`}
+              {inbox.toExecute.length > 0 && inbox.toValidate.length > 0 && " · "}
+              {inbox.toValidate.length > 0 && `${t(lang, "toValidate")} : ${inbox.toValidate.length}`}
+            </div>
+          </div>
+          <ChevronRight size={18} className="text-slate-500" />
+        </Link>
+      )}
       {triggered.length > 0 && (
         <div role="alert" className="mb-5 space-y-1.5 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
           {triggered.map((m, i) => (

@@ -27,6 +27,13 @@ export interface LocalTransaction {
   modifie_le?: string | null;
   supprime: boolean;
   espace_id: string;
+  /** Ordre (transaction planifiée) exécuté par cette transaction. */
+  ordre_id?: string | null;
+  /** Traces renseignées par le serveur. */
+  valide_par?: string | null;
+  valide_le?: string | null;
+  supprime_par?: string | null;
+  motif_refus?: string | null;
   dirty?: Dirty;
 }
 
@@ -51,6 +58,8 @@ export interface LocalUserEspace {
   user_id: string;
   espace_id: string;
   role_dans_espace: Role;
+  /** Titre affiché : Trésorier, Commissaire aux comptes… (les droits viennent du rôle). */
+  fonction?: string | null;
 }
 
 export interface LocalBudget {
@@ -118,13 +127,39 @@ export interface LocalScheduled {
   montant: number;
   categorie: string;
   date_prevue: string;
-  statut: "en_attente" | "realisee" | "annulee";
+  statut: "en_attente" | "realisee" | "annulee" | "refusee";
   alerte_jours_avant: number;
   auteur_id: string;
   espace_id: string;
   cree_le: string;
+  /** Exécutant désigné (null = tout superviseur / admin). */
+  assigne_a?: string | null;
+  realisee_par?: string | null;
+  realisee_le?: string | null;
+  transaction_client_uuid?: string | null;
+  annulee_par?: string | null;
+  annulee_le?: string | null;
+  motif_annulation?: string | null;
   dirty?: Dirty;
   deleted?: boolean;
+}
+
+/** Événement du fil d'activité (écrit par le serveur ; localement en mode sans compte). */
+export interface LocalEvent {
+  id: string;
+  espace_id: string;
+  type: string;
+  acteur_id: string | null;
+  acteur_nom: string | null;
+  acteur_fonction: string | null;
+  cible_id: string | null;
+  titre: string;
+  montant: number | null;
+  type_operation: "miditra" | "mivoaka" | null;
+  ref_table: string | null;
+  ref_id: string | null;
+  details: Record<string, unknown> | null;
+  cree_le: string;
 }
 
 export interface LocalSetting {
@@ -160,6 +195,7 @@ class BudgetDB extends Dexie {
   scheduled!: Table<LocalScheduled, number>;
   settings!: Table<LocalSetting, number>;
   categories!: Table<LocalCategory, number>;
+  evenements!: Table<LocalEvent, string>;
 
   constructor(name: string) {
     super(name);
@@ -175,6 +211,10 @@ class BudgetDB extends Dexie {
       scheduled: "++id, &uuid, espace_id, auteur_id, dirty",
       settings: "++id, [espace_id+cle], espace_id, dirty",
       categories: "++id, nom, ordre, cloud_id, dirty",
+    });
+    this.version(7).stores({
+      scheduled: "++id, &uuid, espace_id, auteur_id, assigne_a, statut, dirty",
+      evenements: "id, espace_id, cree_le, [espace_id+cree_le]",
     });
   }
 }
@@ -411,8 +451,9 @@ export async function ensureSeedData(): Promise<void> {
 
 /** Efface toutes les données d'un espace sur cet appareil. */
 export async function purgeEspaceLocal(espaceId: string, opts: { keepEspace?: boolean } = {}) {
-  await db.transaction("rw", [db.transactions, db.budgets, db.alertes, db.journal_audit, db.recurring, db.scheduled, db.settings, db.user_espaces, db.espaces], async () => {
+  await db.transaction("rw", [db.transactions, db.budgets, db.alertes, db.journal_audit, db.recurring, db.scheduled, db.settings, db.user_espaces, db.espaces, db.evenements], async () => {
     await db.transactions.where("espace_id").equals(espaceId).delete();
+    await db.evenements.where("espace_id").equals(espaceId).delete();
     await db.budgets.where("espace_id").equals(espaceId).delete();
     await db.alertes.where("espace_id").equals(espaceId).delete();
     await db.journal_audit.where("espace_id").equals(espaceId).delete();
@@ -459,6 +500,8 @@ export interface BackupData {
   scheduled: LocalScheduled[];
   settings: LocalSetting[];
   categories: LocalCategory[];
+  /** Historique des actions (qui a fait quoi). */
+  evenements?: LocalEvent[];
 }
 
 function stripLocal<T extends object>(rows: T[]): T[] {
@@ -484,11 +527,22 @@ export async function exportAllData(): Promise<string> {
     scheduled: stripLocal(notDeleted(await db.scheduled.toArray())),
     settings: stripLocal(await db.settings.toArray()),
     categories: stripLocal(notDeleted(await db.categories.toArray())).map((c) => ({ ...c, cloud_id: null })),
+    evenements: await db.evenements.toArray(),
   };
   return JSON.stringify(data, null, 2);
 }
 
 const MAX_BACKUP_ROWS = 200_000;
+
+function safeDetails(v: unknown): Record<string, unknown> | null {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  try {
+    const raw = JSON.stringify(v);
+    return raw.length <= 2000 ? (JSON.parse(raw) as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
 
 function str(v: unknown, max = 255): string {
   return String(v ?? "").slice(0, max);
@@ -544,7 +598,7 @@ export async function importBackup(
   const espaceFor = (v: unknown) => (merge ? target! : str(v, 64));
   let imported = 0;
 
-  await db.transaction("rw", [db.transactions, db.espaces, db.user_espaces, db.budgets, db.alertes, db.recurring, db.scheduled, db.settings, db.categories], async () => {
+  await db.transaction("rw", [db.transactions, db.espaces, db.user_espaces, db.budgets, db.alertes, db.recurring, db.scheduled, db.settings, db.categories, db.evenements], async () => {
     if (!merge) {
       await Promise.all([
         db.transactions.clear(), db.espaces.clear(), db.user_espaces.clear(), db.budgets.clear(), db.alertes.clear(),
@@ -601,10 +655,34 @@ export async function importBackup(
       await db.scheduled.add({
         uuid: genId(), titre: str(s.titre), motif: str(s.motif), type_operation: s.type_operation === "miditra" ? "miditra" : "mivoaka",
         montant: num(s.montant), categorie: str(s.categorie, 40) || "autre", date_prevue: isoDate(s.date_prevue),
-        statut: (["en_attente", "realisee", "annulee"].includes(String(s.statut)) ? s.statut : "en_attente") as LocalScheduled["statut"],
+        statut: (["en_attente", "realisee", "annulee", "refusee"].includes(String(s.statut)) ? s.statut : "en_attente") as LocalScheduled["statut"],
         alerte_jours_avant: Math.max(0, Math.round(num(s.alerte_jours_avant))), auteur_id: opts.userId,
         espace_id: espaceFor(s.espace_id), cree_le: str(s.cree_le, 40) || nowISO(), dirty: flag,
       });
+    }
+    // Historique : restauré seulement en mode sans compte (en ligne, il vient du serveur).
+    if (!merge && localMode) {
+      await db.evenements.clear();
+      for (const e of arr(data, "evenements").slice(0, 5000)) {
+        const id = str(e.id, 64);
+        if (!id) continue;
+        await db.evenements.put({
+          id,
+          espace_id: str(e.espace_id, 64),
+          type: str(e.type, 40),
+          acteur_id: e.acteur_id ? str(e.acteur_id, 64) : null,
+          acteur_nom: e.acteur_nom ? str(e.acteur_nom, 100) : null,
+          acteur_fonction: e.acteur_fonction ? str(e.acteur_fonction, 60) : null,
+          cible_id: e.cible_id ? str(e.cible_id, 64) : null,
+          titre: str(e.titre),
+          montant: e.montant == null ? null : num(e.montant),
+          type_operation: e.type_operation === "miditra" ? "miditra" : e.type_operation === "mivoaka" ? "mivoaka" : null,
+          ref_table: e.ref_table ? str(e.ref_table, 40) : null,
+          ref_id: e.ref_id ? str(e.ref_id, 64) : null,
+          details: safeDetails(e.details),
+          cree_le: str(e.cree_le, 40) || nowISO(),
+        });
+      }
     }
     if (!merge) {
       for (const s of arr(data, "settings")) {

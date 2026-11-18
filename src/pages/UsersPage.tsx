@@ -18,13 +18,39 @@ interface Member {
   langue: Lang;
   actif: boolean;
   cree_le: string;
+  fonction?: string | null;
 }
 
 interface Invitation {
   id: string;
   email: string;
   role: Role;
+  fonction?: string | null;
   cree_le: string;
+}
+
+const FONCTION_SUGGESTIONS = ["Président", "Trésorier", "Trésorier adjoint", "Commissaire aux comptes", "Secrétaire", "Comptable", "Membre"];
+
+function FonctionInput({ value, onChange, lang }: { value: string; onChange: (v: string) => void; lang: Lang }) {
+  return (
+    <div>
+      <label htmlFor="m-fonction" className="input-label">{t(lang, "fonction")}</label>
+      <input
+        id="m-fonction"
+        list="fonction-suggestions"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="input"
+        maxLength={60}
+        placeholder={t(lang, "fonctionPlaceholder")}
+        autoComplete="off"
+      />
+      <datalist id="fonction-suggestions">
+        {FONCTION_SUGGESTIONS.map((f) => <option key={f} value={f} />)}
+      </datalist>
+      <p className="mt-1 text-xs text-slate-500">{t(lang, "fonctionHint")}</p>
+    </div>
+  );
 }
 
 const ROLE_ORDER: Role[] = ["operateur", "superviseur", "admin"];
@@ -91,6 +117,7 @@ export function UsersPage() {
   const [fEmail, setFEmail] = useState("");
   const [fNom, setFNom] = useState("");
   const [fRole, setFRole] = useState<Role>("operateur");
+  const [fFonction, setFFonction] = useState("");
   const [fLang, setFLang] = useState<Lang>("fr");
   const [fActif, setFActif] = useState(true);
 
@@ -122,6 +149,7 @@ export function UsersPage() {
     setEditing(null);
     setFEmail("");
     setFRole("operateur");
+    setFFonction("");
     setFormError(null);
     setModal("create");
   };
@@ -130,6 +158,7 @@ export function UsersPage() {
     setEditing(u);
     setFNom(u.nom);
     setFRole(u.role);
+    setFFonction(u.fonction ?? "");
     setFLang(u.langue);
     setFActif(u.actif);
     setFormError(null);
@@ -147,11 +176,13 @@ export function UsersPage() {
           espace_id: espaceId,
           email: fEmail.trim(),
           role: fRole,
+          fonction: fFonction.trim() || null,
         });
         toast(res.status === "invited" ? t(lang, "invitationSent", { email: fEmail.trim().toLowerCase() }) : t(lang, "memberAdded"), "success");
       } else if (editing) {
         const body: Record<string, unknown> = { espace_id: espaceId, user_id: editing.id };
         if (fRole !== editing.role) body.role = fRole;
+        if (fFonction.trim() !== (editing.fonction ?? "")) body.fonction = fFonction.trim() || null;
         if (fNom.trim() !== editing.nom) body.nom = fNom.trim();
         if (fLang !== editing.langue) body.langue = fLang;
         if (fActif !== editing.actif) body.actif = fActif;
@@ -248,7 +279,7 @@ export function UsersPage() {
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-semibold text-white">{u.nom}{u.id === me?.id && <span className="ml-1 text-xs text-slate-500">({t(lang, "you")})</span>}</div>
                       <div className="truncate text-xs text-slate-400">{u.email}</div>
-                      <div className="mt-1 flex gap-1.5"><RoleBadge role={u.role} lang={lang} />{!u.actif && <span className="badge-expense">{t(lang, "inactive")}</span>}</div>
+                      <div className="mt-1 flex flex-wrap items-center gap-1.5"><RoleBadge role={u.role} lang={lang} />{u.fonction && <span className="text-xs font-medium text-slate-300">{u.fonction}</span>}{!u.actif && <span className="badge-expense">{t(lang, "inactive")}</span>}</div>
                     </div>
                     {u.id !== me?.id && (
                       <div className="flex flex-col gap-1">
@@ -285,7 +316,12 @@ export function UsersPage() {
                             </div>
                           </td>
                           <td className="px-4 py-3 text-slate-400">{u.email}</td>
-                          <td className="px-4 py-3"><RoleBadge role={u.role} lang={lang} /></td>
+                          <td className="px-4 py-3">
+                            <div className="flex flex-col items-start gap-1">
+                              <RoleBadge role={u.role} lang={lang} />
+                              {u.fonction && <span className="text-xs text-slate-400">{u.fonction}</span>}
+                            </div>
+                          </td>
                           <td className="px-4 py-3">{u.actif ? <span className="badge-synced">{t(lang, "active")}</span> : <span className="badge-expense">{t(lang, "inactive")}</span>}</td>
                           <td className="px-4 py-3 text-slate-400">{formatDateTime(u.cree_le, lang)}</td>
                           <td className="px-4 py-3 text-right">
@@ -320,6 +356,7 @@ export function UsersPage() {
                       <div className="truncate text-sm font-medium text-slate-200">{inv.email}</div>
                       <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
                         <RoleBadge role={inv.role} lang={lang} />
+                        {inv.fonction && <span className="text-slate-300">{inv.fonction}</span>}
                         <span>{formatDateTime(inv.cree_le, lang)}</span>
                       </div>
                     </div>
@@ -356,6 +393,7 @@ export function UsersPage() {
                     </div>
                   </div>
                   <RolePicker value={fRole} onChange={setFRole} lang={lang} />
+                  <FonctionInput value={fFonction} onChange={setFFonction} lang={lang} />
                 </>
               ) : (
                 <>
@@ -367,6 +405,7 @@ export function UsersPage() {
                     </div>
                   </div>
                   <RolePicker value={fRole} onChange={setFRole} lang={lang} />
+                  <FonctionInput value={fFonction} onChange={setFFonction} lang={lang} />
                   <div>
                     <label htmlFor="m-lang" className="input-label">{t(lang, "language")}</label>
                     <select id="m-lang" value={fLang} onChange={(e) => setFLang(e.target.value as Lang)} className="input">

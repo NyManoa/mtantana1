@@ -9,6 +9,8 @@ export interface Espace {
   nom: string;
   cree_le: string;
   role_dans_espace: Role;
+  /** Ma fonction dans cet espace (Trésorier…), purement descriptive. */
+  fonction?: string | null;
 }
 
 type Result = { error: string | null };
@@ -18,6 +20,7 @@ interface EspaceContextValue {
   currentEspace: Espace | null;
   /** Rôle de l'utilisateur DANS l'espace courant (c'est lui qui donne les droits). */
   role: Role;
+  fonction: string | null;
   setCurrentEspace: (e: Espace | null) => void;
   loading: boolean;
   refresh: () => Promise<void>;
@@ -53,7 +56,7 @@ export function EspaceProvider({ children }: { children: ReactNode }) {
       const memberships = await db.user_espaces.where("user_id").equals(profile.id).toArray();
       const all = await db.espaces.bulkGet(memberships.map((m) => m.espace_id));
       const list: Espace[] = memberships
-        .map((m, i) => (all[i] ? { ...all[i]!, role_dans_espace: m.role_dans_espace } : null))
+        .map((m, i): Espace | null => (all[i] ? { ...all[i]!, role_dans_espace: m.role_dans_espace, fonction: m.fonction ?? null } : null))
         .filter((e): e is Espace => e !== null)
         .sort((a, b) => a.cree_le.localeCompare(b.cree_le));
       setEspaces(list);
@@ -77,7 +80,7 @@ export function EspaceProvider({ children }: { children: ReactNode }) {
         await acceptInvitations();
         const { data: mine, error } = await supabase
           .from("user_espaces")
-          .select("espace_id, role_dans_espace, espaces(id, nom, cree_le)")
+          .select("espace_id, role_dans_espace, fonction, espaces(id, nom, cree_le)")
           .eq("user_id", profile.id);
         if (!error && mine) {
           const ids = new Set(mine.map((m) => m.espace_id as string));
@@ -88,7 +91,12 @@ export function EspaceProvider({ children }: { children: ReactNode }) {
             }
             await db.user_espaces.where("user_id").equals(profile.id).delete();
             for (const m of mine) {
-              await db.user_espaces.add({ user_id: profile.id, espace_id: m.espace_id as string, role_dans_espace: m.role_dans_espace as Role });
+              await db.user_espaces.add({
+                user_id: profile.id,
+                espace_id: m.espace_id as string,
+                role_dans_espace: m.role_dans_espace as Role,
+                fonction: (m as { fonction?: string | null }).fonction ?? null,
+              });
             }
           });
           for (const e of await db.espaces.toArray()) {
@@ -186,10 +194,11 @@ export function EspaceProvider({ children }: { children: ReactNode }) {
   };
 
   const role: Role = currentEspace?.role_dans_espace ?? "operateur";
+  const fonction = currentEspace?.fonction ?? null;
 
   return (
     <EspaceContext.Provider
-      value={{ espaces, currentEspace, role, setCurrentEspace, loading, refresh: loadEspaces, createEspace, deleteEspace, resetEspace, renameEspace }}
+      value={{ espaces, currentEspace, role, fonction, setCurrentEspace, loading, refresh: loadEspaces, createEspace, deleteEspace, resetEspace, renameEspace }}
     >
       {children}
     </EspaceContext.Provider>

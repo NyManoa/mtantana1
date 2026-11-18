@@ -33,6 +33,36 @@ Les droits dépendent du rôle **dans l'espace courant** : une même personne pe
 Ces règles sont appliquées **par la base de données** (policies RLS), pas
 seulement par l'interface.
 
+## Ordres, validations et notifications
+
+Exemple : vous êtes **admin** avec la fonction « Commissaire aux comptes », le
+trésorier est **superviseur** avec la fonction « Trésorier » (Membres → modifier
+→ *Fonction*). Les droits viennent du rôle ; la fonction est un titre affiché.
+
+1. **Ordre** — Ordres → *Nouvel ordre* : débit ou crédit, montant, date,
+   exécutant (le trésorier, ou « tout superviseur / admin »).
+2. **Notification** — tous les membres connectés de l'espace sont avertis en
+   temps réel (cloche, message, et notification système si activée sur
+   l'appareil). Rappel automatique à l'approche de la date.
+3. **Exécution** — le trésorier clique *Exécuter le débit* : la transaction est
+   créée avec **le montant fixé par l'admin** (non modifiable) et elle est
+   **validée d'office au nom de l'admin**. Il peut aussi *Refuser* (motif
+   obligatoire) ; l'admin peut *Annuler* ou *Rouvrir*.
+4. **Saisie libre** — le trésorier peut toujours saisir au formulaire. Avec
+   Paramètres → *Toutes les saisies doivent être validées*, chaque saisie d'un
+   non-admin reste « en attente » ; l'admin la **valide** ou la **refuse**
+   (motif obligatoire, notifié à l'auteur) depuis Ordres → *À faire*.
+
+**Traçabilité** : Ordres → *Activité* montre qui a émis, exécuté, refusé,
+validé, modifié ou supprimé quoi, et quand. En ligne, cet historique est écrit
+**par la base de données** (triggers) : personne ne peut le modifier, pas même
+un admin. Chaque transaction indique aussi qui l'a validée et si elle provient
+d'un ordre ; le journal d'audit (admin) garde le détail avant / après.
+
+Ces règles sont vérifiées par le serveur : un exécutant ne peut pas changer le
+montant d'un ordre, exécuter un ordre qui ne lui est pas destiné, ni l'exécuter
+deux fois.
+
 ## Inviter quelqu'un dans un espace
 
 Membres → **Inviter** → adresse e-mail + rôle.
@@ -64,8 +94,13 @@ Appliquer les migrations, dont `20261118120000_security_hardening.sql`
 (invitations, anti-pause) :
 
 **Sans installer d'outil (recommandé)** : Supabase → *SQL Editor* → *New query* →
-coller tout le fichier `supabase/sql-editor/appliquer-mises-a-jour-2026-11-18.sql`
-→ *Run*. Tout passe dans une seule transaction : en cas d'erreur, rien n'est modifié.
+coller tout le fichier, puis *Run*, **dans cet ordre** :
+
+1. `supabase/sql-editor/appliquer-mises-a-jour-2026-11-18.sql` (sécurité, invitations, anti-pause)
+2. `supabase/sql-editor/appliquer-ordres-notifications-2026-11-19.sql` (ordres, fonctions, notifications)
+
+Chaque fichier passe dans une seule transaction : en cas d'erreur, rien n'est
+modifié. Les rejouer est sans risque.
 
 Avec la CLI (`npx supabase@latest …`) :
 

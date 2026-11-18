@@ -15,6 +15,7 @@ import { useAuth } from "./auth";
 import { useEspace } from "./espace";
 import { useDataVersion } from "./sync";
 import type { TransactionFormData } from "@/components/TransactionForm";
+import { logLocalEvent } from "./ordres";
 
 export interface DisplayTransaction {
   id: string;
@@ -32,6 +33,10 @@ export interface DisplayTransaction {
   synced: boolean;
   auteur_id: string;
   espace_id?: string;
+  /** Traçabilité */
+  ordre_id?: string | null;
+  valide_par_nom?: string | null;
+  valide_le?: string | null;
 }
 
 export interface Category {
@@ -164,6 +169,9 @@ export function useTransactions() {
           synced: !r.dirty,
           auteur_id: r.auteur_id,
           espace_id: r.espace_id,
+          ordre_id: r.ordre_id ?? null,
+          valide_par_nom: r.valide_par ? names.get(r.valide_par) ?? null : null,
+          valide_le: r.valide_le ?? null,
         }))
         .sort((a, b) => (b.date_transaction + b.cree_le).localeCompare(a.date_transaction + a.cree_le)),
     );
@@ -171,7 +179,8 @@ export function useTransactions() {
       cats.filter((c) => c.active && !c.deleted).map((c) => ({ id: c.id!, nom: c.nom, couleur: c.couleur, icone: c.icone, ordre: c.ordre, active: c.active, user_id: c.user_id ?? null })),
     );
     const n = Number(seuil?.valeur);
-    setValidationThreshold(Number.isFinite(n) && n > 0 ? n : DEFAULT_THRESHOLD);
+    // 0 = toute saisie d'un non-admin doit être validée.
+    setValidationThreshold(seuil && Number.isFinite(n) && n >= 0 ? n : DEFAULT_THRESHOLD);
     setLoading(false);
   }, [espaceId, profile, seesAll]);
 
@@ -204,10 +213,16 @@ export function useTransactions() {
         modifie_le: null,
         supprime: false,
         espace_id: espaceId,
+        valide_par: statut === "validee" && isAdmin ? profile.id : null,
+        valide_le: statut === "validee" && isAdmin ? nowISO() : null,
         dirty: dirtyFlag(),
       };
       await db.transactions.add(row);
       await addLocalAudit("creation", row.client_uuid, null, data, profile.id, espaceId);
+      await logLocalEvent({
+        espace_id: espaceId, type: statut === "validee" ? "saisie" : "saisie_a_valider", acteur_id: profile.id, titre: row.motif,
+        montant: row.montant, type_operation: row.type_operation, ref_table: "transactions", ref_id: row.client_uuid,
+      });
       notifyDataChanged();
     },
     [profile, espaceId, validationThreshold, isAdmin],
@@ -255,8 +270,38 @@ export function useTransactions() {
       if (!profile || !espaceId || !isAdmin) return;
       const local = await db.transactions.where("client_uuid").equals(clientUuid).first();
       if (!local?.id) return;
-      await db.transactions.update(local.id, { statut: "validee", modifie_le: nowISO(), dirty: dirtyFlag() });
+      await db.transactions.update(local.id, { statut: "validee", valide_par: profile.id, valide_le: nowISO(), modifie_le: nowISO(), dirty: dirtyFlag() });
       await addLocalAudit("validation", clientUuid, local.statut, "validee", profile.id, espaceId);
+      await logLocalEvent({
+        espace_id: espaceId, type: "transaction_validee", acteur_id: profile.id, cible_id: local.auteur_id, titre: local.motif,
+        montant: local.montant, type_operation: local.type_operation, ref_table: "transactions", ref_id: clientUuid,
+      });
+      notifyDataChanged();
+    },
+    [profile, espaceId, isAdmin],
+  );
+
+  /** Refus d'une saisie par un admin : retirée des comptes, motif conservé et notifié à l'auteur. */
+  const refuseTransaction = useCallback(
+    async (clientUuid: string, motif: string) => {
+      if (!profile || !espaceId || !isAdmin) return;
+      const reason = motif.trim().slice(0, 500);
+      if (!reason) throw new Error("Motif du refus obligatoire");
+      const local = await db.transactions.where("client_uuid").equals(clientUuid).first();
+      if (!local?.id) return;
+      await db.transactions.update(local.id, {
+        supprime: true,
+        supprime_par: profile.id,
+        motif_refus: reason,
+        modifie_le: nowISO(),
+        dirty: dirtyFlag(),
+      });
+      await addLocalAudit("suppression", clientUuid, local, { refus: reason }, profile.id, espaceId);
+      await logLocalEvent({
+        espace_id: espaceId, type: "transaction_refusee", acteur_id: profile.id, cible_id: local.auteur_id, titre: local.motif,
+        montant: local.montant, type_operation: local.type_operation, ref_table: "transactions", ref_id: clientUuid,
+        details: { motif: reason },
+      });
       notifyDataChanged();
     },
     [profile, espaceId, isAdmin],
@@ -271,6 +316,7 @@ export function useTransactions() {
     updateTransaction,
     deleteTransaction,
     validateTransaction,
+    refuseTransaction,
     reload: load,
     genClientUuid,
   };

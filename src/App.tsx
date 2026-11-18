@@ -21,6 +21,8 @@ import { BudgetsPage } from "@/pages/BudgetsPage";
 import { RecurringPage } from "@/pages/RecurringPage";
 import { AlertsPage } from "@/pages/AlertsPage";
 import { ImportPage } from "@/pages/ImportPage";
+import { OrdresPage } from "@/pages/OrdresPage";
+import { NotificationCenter } from "@/components/NotificationCenter";
 import type { Role } from "@/lib/db";
 
 const roleRank: Record<Role, number> = { operateur: 0, superviseur: 1, admin: 2 };
@@ -81,6 +83,7 @@ function AppRoutes() {
       <Route path="/saisie" element={<ProtectedRoute><SaisiePage /></ProtectedRoute>} />
       <Route path="/transactions" element={<ProtectedRoute><TransactionsPage /></ProtectedRoute>} />
       <Route path="/recurring" element={<ProtectedRoute><RecurringPage /></ProtectedRoute>} />
+      <Route path="/ordres" element={<ProtectedRoute><OrdresPage /></ProtectedRoute>} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
       <Route path="/dashboard" element={<ProtectedRoute minRole="superviseur"><DashboardPage /></ProtectedRoute>} />
       <Route path="/budgets" element={<ProtectedRoute minRole="superviseur"><BudgetsPage /></ProtectedRoute>} />
@@ -125,6 +128,7 @@ export default function App() {
             <InvitationNotice />
             <EspaceProvider>
               <BrowserRouter>
+                <NotificationCenter />
                 <AppRoutes />
               </BrowserRouter>
             </EspaceProvider>

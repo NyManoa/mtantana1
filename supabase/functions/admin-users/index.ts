@@ -5,11 +5,11 @@
 // jamais utilisé pour autoriser une action.
 //
 //   GET    ?espace_id=…                       → membres + invitations en attente
-//   POST   { email, role, espace_id }
+//   POST   { email, role, fonction?, espace_id }
 //            → compte existant : ajouté tout de suite à l'espace
 //            → sinon : invitation en attente, acceptée automatiquement quand la
 //              personne se connecte avec cette adresse (Google ou e-mail confirmé)
-//   PUT    { user_id, espace_id, role?, nom?, langue?, actif? }
+//   PUT    { user_id, espace_id, role?, fonction?, nom?, langue?, actif? }
 //   DELETE ?user_id=…&espace_id=…             → retire le membre de l'espace
 //   DELETE ?invitation_id=…&espace_id=…       → annule une invitation
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
@@ -39,6 +39,13 @@ class HttpError extends Error {
   constructor(public status: number, message: string) {
     super(message);
   }
+}
+
+/** Titre libre (Trésorier, Commissaire aux comptes…) ; null = aucun. */
+function cleanFonction(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const f = v.replace(/[\u0000-\u001f<>]/g, "").trim().slice(0, 60);
+  return f || null;
 }
 
 function isUuid(v: unknown): v is string {
@@ -99,25 +106,25 @@ Deno.serve(async (req: Request) => {
       const espaceId = await assertEspaceAdmin(admin, callerId, url.searchParams.get("espace_id"));
       const { data: members, error } = await admin
         .from("user_espaces")
-        .select("role_dans_espace, profiles(id, nom, email, langue, actif, cree_le)")
+        .select("role_dans_espace, fonction, profiles(id, nom, email, langue, actif, cree_le)")
         .eq("espace_id", espaceId);
       if (error) throw error;
       const users = (members ?? [])
         .filter((m) => m.profiles)
         .map((m) => {
           const p = m.profiles as unknown as Record<string, unknown>;
-          return { ...p, role: m.role_dans_espace };
+          return { ...p, role: m.role_dans_espace, fonction: m.fonction ?? null };
         })
         .sort((a, b) => String(b.cree_le).localeCompare(String(a.cree_le)));
       const { data: invitations, error: invErr } = await admin
         .from("invitations_espace")
-        .select("id, email, role_dans_espace, cree_le")
+        .select("id, email, role_dans_espace, fonction, cree_le")
         .eq("espace_id", espaceId)
         .order("cree_le", { ascending: false });
       if (invErr) throw invErr;
       return json({
         users,
-        invitations: (invitations ?? []).map((i) => ({ id: i.id, email: i.email, role: i.role_dans_espace, cree_le: i.cree_le })),
+        invitations: (invitations ?? []).map((i) => ({ id: i.id, email: i.email, role: i.role_dans_espace, fonction: i.fonction ?? null, cree_le: i.cree_le })),
       });
     }
 
@@ -128,6 +135,7 @@ Deno.serve(async (req: Request) => {
       const espaceId = await assertEspaceAdmin(admin, callerId, body.espace_id);
       const email = String(body.email ?? "").trim().toLowerCase();
       const role: Role = ROLES.includes(body.role) ? body.role : "operateur";
+      const fonction = cleanFonction(body.fonction);
       if (!EMAIL_RE.test(email) || email.length > 254) throw new HttpError(400, "Adresse e-mail invalide");
 
       // Compte déjà existant → ajouté tout de suite à l'espace.
@@ -142,7 +150,7 @@ Deno.serve(async (req: Request) => {
         if (already) throw new HttpError(409, "Cette personne est déjà membre de l'espace");
         const { error: ueErr } = await admin
           .from("user_espaces")
-          .insert({ user_id: existing.id, espace_id: espaceId, role_dans_espace: role });
+          .insert({ user_id: existing.id, espace_id: espaceId, role_dans_espace: role, fonction });
         if (ueErr) throw ueErr;
         return json({ status: "added", email, nom: existing.nom });
       }
@@ -155,7 +163,7 @@ Deno.serve(async (req: Request) => {
       if ((count ?? 0) >= 200) throw new HttpError(400, "Trop d'invitations en attente pour cet espace");
       const { error: invErr } = await admin
         .from("invitations_espace")
-        .upsert({ espace_id: espaceId, email, role_dans_espace: role, invite_par: callerId }, { onConflict: "espace_id,email" });
+        .upsert({ espace_id: espaceId, email, role_dans_espace: role, fonction, invite_par: callerId }, { onConflict: "espace_id,email" });
       if (invErr) throw invErr;
       return json({ status: "invited", email });
     }
@@ -185,6 +193,15 @@ Deno.serve(async (req: Request) => {
         const { error } = await admin
           .from("user_espaces")
           .update({ role_dans_espace: body.role })
+          .eq("user_id", userId)
+          .eq("espace_id", espaceId);
+        if (error) throw error;
+      }
+
+      if (body.fonction !== undefined) {
+        const { error } = await admin
+          .from("user_espaces")
+          .update({ fonction: cleanFonction(body.fonction) })
           .eq("user_id", userId)
           .eq("espace_id", espaceId);
         if (error) throw error;

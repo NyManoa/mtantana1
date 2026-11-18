@@ -1,5 +1,7 @@
 import { type ReactNode, useEffect, useState } from "react";
-import { Menu, X, WifiOff } from "lucide-react";
+import { Menu, X, WifiOff, Bell } from "lucide-react";
+import { Link } from "react-router-dom";
+import { useInbox } from "@/lib/inbox";
 import { Sidebar } from "./Sidebar";
 import { Footer } from "./Footer";
 import { useAuth } from "@/lib/auth";
@@ -18,6 +20,8 @@ export function Layout({ children, title, subtitle, actions, noFooter }: LayoutP
   const [mobileOpen, setMobileOpen] = useState(false);
   const { lang, mode, cloudStatus } = useAuth();
   const { state } = useSync();
+  const { unread, taskCount } = useInbox();
+  const badge = unread + taskCount;
   const cloudDown = mode === "cloud" && (!state.online || cloudStatus === "unreachable");
   const downLabel = !state.online ? t(lang, "offline") : t(lang, "serverDown");
 
@@ -74,6 +78,19 @@ export function Layout({ children, title, subtitle, actions, noFooter }: LayoutP
                 {downLabel}
               </span>
             )}
+            <Link
+              to={taskCount > 0 ? "/ordres" : "/ordres?tab=activite"}
+              className="relative rounded-lg p-2 text-slate-400 transition hover:bg-white/10 hover:text-white"
+              aria-label={`${t(lang, "notifications")}${badge ? ` (${badge})` : ""}`}
+              title={t(lang, "notifications")}
+            >
+              <Bell size={19} />
+              {badge > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-bold text-slate-900">
+                  {badge > 99 ? "99+" : badge}
+                </span>
+              )}
+            </Link>
             {actions}
           </div>
         </header>

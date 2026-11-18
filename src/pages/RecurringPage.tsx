@@ -9,6 +9,7 @@ import { useToast } from "@/components/Toast";
 import { db, dirtyFlag, genId, notifyDataChanged, updateDirty } from "@/lib/db";
 import { t, categoryLabel } from "@/lib/i18n";
 import { formatAriary, formatDate, todayISO, daysUntil } from "@/lib/format";
+import { cancelOrder, canExecute, executeOrder, type Order } from "@/lib/ordres";
 
 interface Recurring {
   id: number;
@@ -24,24 +25,12 @@ interface Recurring {
   auteur_id: string;
 }
 
-interface Scheduled {
-  id: number;
-  titre: string;
-  motif: string;
-  categorie: string;
-  type_operation: "miditra" | "mivoaka";
-  montant: number;
-  date_prevue: string;
-  alerte_jours_avant: number;
-  statut: "en_attente" | "realisee" | "annulee";
-  cree_le: string;
-  auteur_id: string;
-}
+type Scheduled = Order;
 
 export function RecurringPage() {
   const { profile, lang } = useAuth();
   const { currentEspace, role } = useEspace();
-  const { categories, createTransaction } = useTransactions();
+  const { categories, validationThreshold } = useTransactions();
   const version = useDataVersion();
   const { show: showToast } = useToast();
   const [recurring, setRecurring] = useState<Recurring[]>([]);
@@ -77,7 +66,7 @@ export function RecurringPage() {
   const loadScheduled = useCallback(async () => {
     if (!currentEspace) return;
     const rows = await db.scheduled.where("espace_id").equals(currentEspace.id).toArray();
-    const pending = rows.filter(r => r.statut === "en_attente" && !r.deleted && (role !== "operateur" || r.auteur_id === profile?.id)).sort((a, b) => a.date_prevue.localeCompare(b.date_prevue));
+    const pending = rows.filter(r => r.statut === "en_attente" && !r.deleted && (role !== "operateur" || r.auteur_id === profile?.id || r.assigne_a === profile?.id)).sort((a, b) => a.date_prevue.localeCompare(b.date_prevue));
     setScheduled(pending.map((s) => ({ ...s, id: s.id! })));
   }, [currentEspace, role, profile?.id]);
 
@@ -85,19 +74,7 @@ export function RecurringPage() {
     Promise.all([loadRecurring(), loadScheduled()]).finally(() => setLoading(false));
   }, [loadRecurring, loadScheduled, version]);
 
-  useEffect(() => {
-    if (scheduled.length === 0) return;
-    for (const s of scheduled) {
-      const daysDiff = daysUntil(s.date_prevue);
-      if (daysDiff <= s.alerte_jours_avant && daysDiff >= 0) {
-        const key = `sched_alert_${s.id}`;
-        if (!localStorage.getItem(key)) {
-          showToast(t(lang, "upcomingAlertHint", { titre: s.titre, date: formatDate(s.date_prevue, lang) }), "success");
-          localStorage.setItem(key, "1");
-        }
-      }
-    }
-  }, [scheduled, lang, showToast]);
+  // Les rappels d'échéance sont affichés par le centre de notifications (une fois par jour).
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -163,24 +140,22 @@ export function RecurringPage() {
     setSchedSubmitting(false);
   };
 
+  // Même circuit que la page Ordres : transaction liée, traces et notifications.
   const handleSchedDone = async (s: Scheduled) => {
-    if (profile) {
-      await createTransaction({
-        client_uuid: genId(),
-        date_transaction: s.date_prevue,
-        motif: s.motif || s.titre,
-        type_operation: s.type_operation,
-        montant: s.montant,
-        categorie: s.categorie,
-      });
+    if (!profile) return;
+    try {
+      await executeOrder(s, profile.id, role, validationThreshold, todayISO());
+      localStorage.removeItem(`sched_alert_${s.id}`);
+      showToast(t(lang, "orderExecuted"), "success");
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : t(lang, "error"), "error");
     }
-    await updateDirty("scheduled", s.id, { statut: "realisee" });
-    localStorage.removeItem(`sched_alert_${s.id}`);
   };
 
-  const handleSchedCancel = async (id: number) => {
-    await updateDirty("scheduled", id, { statut: "annulee" });
-    localStorage.removeItem(`sched_alert_${id}`);
+  const handleSchedCancel = async (s: Scheduled) => {
+    if (!profile) return;
+    await cancelOrder(s, profile.id, "");
+    localStorage.removeItem(`sched_alert_${s.id}`);
   };
 
   const upcomingAlerts = scheduled.filter((s) => {
@@ -221,13 +196,17 @@ export function RecurringPage() {
                     — {formatDate(s.date_prevue, lang)} · {formatAriary(s.montant, lang)}
                   </div>
                 </div>
-                <button onClick={() => handleSchedDone(s)} className="btn-primary !py-1.5 !px-3 !text-xs">
-                  <CheckCircle2 size={14} />
-                  {t(lang, "markAsDone")}
-                </button>
-                <button onClick={() => handleSchedCancel(s.id)} className="btn-ghost !py-1.5 !px-2 !text-xs">
-                  <X size={14} />
-                </button>
+                {profile && canExecute(s, profile.id, role) && (
+                  <button onClick={() => handleSchedDone(s)} className="btn-primary !py-1.5 !px-3 !text-xs">
+                    <CheckCircle2 size={14} />
+                    {t(lang, "markAsDone")}
+                  </button>
+                )}
+                {(role === "admin" || s.auteur_id === profile?.id) && (
+                  <button onClick={() => handleSchedCancel(s)} className="btn-ghost !py-1.5 !px-2 !text-xs" aria-label={t(lang, "cancel")}>
+                    <X size={14} />
+                  </button>
+                )}
               </div>
             );
           })}
@@ -270,14 +249,18 @@ export function RecurringPage() {
                     <Clock size={11} />
                     {t(lang, "alertDays")}: {s.alerte_jours_avant}
                   </div>
-                  {(role === "admin" || s.auteur_id === profile?.id) && <div className="mt-3 flex gap-1.5">
-                    <button onClick={() => handleSchedDone(s)} className="btn-primary !py-1.5 !px-2.5 !text-xs flex-1">
-                      <CheckCircle2 size={13} />{t(lang, "markAsDone")}
-                    </button>
-                    <button onClick={() => handleSchedCancel(s.id)} className="btn-ghost !py-1.5 !px-2 !text-xs" aria-label={t(lang, "cancel")}>
-                      <X size={13} />
-                    </button>
-                  </div>}
+                  <div className="mt-3 flex gap-1.5">
+                    {profile && canExecute(s, profile.id, role) && (
+                      <button onClick={() => handleSchedDone(s)} className="btn-primary !py-1.5 !px-2.5 !text-xs flex-1">
+                        <CheckCircle2 size={13} />{t(lang, "markAsDone")}
+                      </button>
+                    )}
+                    {(role === "admin" || s.auteur_id === profile?.id) && (
+                      <button onClick={() => handleSchedCancel(s)} className="btn-ghost !py-1.5 !px-2 !text-xs" aria-label={t(lang, "cancel")}>
+                        <X size={13} />
+                      </button>
+                    )}
+                  </div>
                 </div>
               );
             })}

@@ -17,6 +17,7 @@ import {
   Bell,
   Upload,
   Building2,
+  ClipboardCheck,
   ChevronDown,
   Download,
   Plus,
@@ -34,6 +35,7 @@ import { formatDateTime } from "@/lib/format";
 import type { Role } from "@/lib/db";
 import { useState, useEffect } from "react";
 import { useToast } from "@/components/Toast";
+import { useInbox } from "@/lib/inbox";
 
 interface NavItem {
   to: string;
@@ -41,6 +43,8 @@ interface NavItem {
   icon: LucideIcon;
   roles: Role[];
   cloudOnly?: boolean;
+  /** Pastille : nombre d'éléments à traiter */
+  badge?: "tasks";
 }
 
 const ALL: Role[] = ["operateur", "admin", "superviseur"];
@@ -49,6 +53,7 @@ const navItems: NavItem[] = [
   { to: "/dashboard", labelKey: "dashboard", icon: LayoutDashboard, roles: ["admin", "superviseur"] },
   { to: "/transactions", labelKey: "transactions", icon: ArrowRightLeft, roles: ALL },
   { to: "/budgets", labelKey: "budgets", icon: Target, roles: ["admin", "superviseur"] },
+  { to: "/ordres", labelKey: "orders", icon: ClipboardCheck, roles: ALL, badge: "tasks" },
   { to: "/recurring", labelKey: "recurring", icon: Repeat, roles: ALL },
   { to: "/import", labelKey: "importExcel", icon: Upload, roles: ["admin"] },
   { to: "/alerts", labelKey: "alerts", icon: Bell, roles: ["admin", "superviseur"] },
@@ -127,7 +132,8 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const { profile, lang, setLang, signOut, mode } = useAuth();
   const navigate = useNavigate();
   const { state } = useSync();
-  const { espaces, currentEspace, setCurrentEspace, createEspace, role } = useEspace();
+  const { espaces, currentEspace, setCurrentEspace, createEspace, role, fonction } = useEspace();
+  const { taskCount } = useInbox();
   const { show: showToast } = useToast();
   const [espaceMenuOpen, setEspaceMenuOpen] = useState(false);
   const [showCreateEspace, setShowCreateEspace] = useState(false);
@@ -281,7 +287,12 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         {items.map((item) => (
           <NavLink key={item.to} to={item.to} onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? "nav-item-active" : ""}`}>
             <item.icon size={18} />
-            <span>{t(lang, item.labelKey)}</span>
+            <span className="flex-1">{t(lang, item.labelKey)}</span>
+            {item.badge === "tasks" && taskCount > 0 && (
+              <span className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-bold leading-none text-slate-900" aria-label={t(lang, "tasksPending", { n: taskCount })}>
+                {taskCount}
+              </span>
+            )}
           </NavLink>
         ))}
       </nav>
@@ -325,7 +336,10 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
           </div>
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm font-semibold text-white">{profile?.nom}</div>
-            <div className="mt-0.5">{roleBadge}</div>
+            <div className="mt-0.5 flex flex-wrap items-center gap-1">
+              {roleBadge}
+              {fonction && <span className="truncate text-[10px] font-medium text-slate-400">{fonction}</span>}
+            </div>
             {mode === "local" && <div className="mt-0.5 truncate text-[10px] text-cyan-300/80">{t(lang, "localMode")}</div>}
           </div>
           <button onClick={handleSignOut} className="rounded-lg p-2 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400" title={t(lang, "logout")} aria-label={t(lang, "logout")}>

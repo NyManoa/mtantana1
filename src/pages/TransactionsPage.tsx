@@ -8,7 +8,7 @@ import { t } from "@/lib/i18n";
 export function TransactionsPage() {
   const { lang, profile } = useAuth();
   const { role } = useEspace();
-  const { transactions, categories, validationThreshold, createTransaction, updateTransaction, deleteTransaction, validateTransaction } = useTransactions();
+  const { transactions, categories, validationThreshold, createTransaction, updateTransaction, deleteTransaction, validateTransaction, refuseTransaction } = useTransactions();
   const showAuthor = role === "admin" || role === "superviseur";
 
   return (
@@ -25,6 +25,7 @@ export function TransactionsPage() {
         onUpdate={updateTransaction}
         onDelete={deleteTransaction}
         onValidate={role === "admin" ? validateTransaction : undefined}
+        onRefuse={role === "admin" ? refuseTransaction : undefined}
       />
     </Layout>
   );

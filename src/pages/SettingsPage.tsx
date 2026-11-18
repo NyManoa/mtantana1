@@ -93,15 +93,30 @@ export function SettingsPage() {
     db.settings.where("[espace_id+cle]").equals([currentEspace.id, "seuil_validation"]).first().then((s) => setThreshold(s?.valeur ?? String(DEFAULT_THRESHOLD)));
   }, [currentEspace, version]);
 
+  const writeThreshold = async (n: number) => {
+    if (!currentEspace) return;
+    const existing = await db.settings.where("[espace_id+cle]").equals([currentEspace.id, "seuil_validation"]).first();
+    if (existing?.id) await db.settings.update(existing.id, { valeur: String(n), dirty: dirtyFlag() });
+    else await db.settings.add({ cle: "seuil_validation", valeur: String(n), espace_id: currentEspace.id, dirty: dirtyFlag() });
+    notifyDataChanged();
+  };
+
+  // Seuil 0 = toute saisie d'un non-admin passe par la validation.
+  const validateAll = threshold === "0";
+  const toggleValidateAll = () =>
+    busyWrap(async () => {
+      const next = validateAll ? DEFAULT_THRESHOLD : 0;
+      await writeThreshold(next);
+      setThreshold(String(next));
+      flash("ok", t(lang, "saved"));
+    });
+
   const saveThreshold = () =>
     busyWrap(async () => {
       if (!currentEspace) return;
       const n = Number(threshold);
       if (!Number.isFinite(n) || n <= 0) throw new Error(t(lang, "fillAllFields"));
-      const existing = await db.settings.where("[espace_id+cle]").equals([currentEspace.id, "seuil_validation"]).first();
-      if (existing?.id) await db.settings.update(existing.id, { valeur: String(n), dirty: dirtyFlag() });
-      else await db.settings.add({ cle: "seuil_validation", valeur: String(n), espace_id: currentEspace.id, dirty: dirtyFlag() });
-      notifyDataChanged();
+      await writeThreshold(n);
       flash("ok", t(lang, "saved"));
     });
 
@@ -419,10 +434,19 @@ export function SettingsPage() {
         {/* Seuil de validation */}
         {isAdmin && currentEspace && (
           <Section icon={SlidersHorizontal} color="bg-amber-500/15 text-amber-400" title={`${t(lang, "thresholdSetting")} · ${currentEspace.nom}`} hint={t(lang, "thresholdSettingHint")}>
-            <form className="flex gap-2" onSubmit={(e) => { e.preventDefault(); saveThreshold(); }}>
-              <input type="number" inputMode="numeric" step="1000" min="1" value={threshold} onChange={(e) => setThreshold(e.target.value)} className="input" placeholder="100000" />
-              <button type="submit" className="btn-primary shrink-0">{t(lang, "update")}</button>
-            </form>
+            <label className="mb-4 flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-white/5 p-3">
+              <input type="checkbox" checked={validateAll} onChange={toggleValidateAll} className="mt-1 h-4 w-4 accent-emerald-500" />
+              <span>
+                <span className="block text-sm font-semibold text-white">{t(lang, "validateAll")}</span>
+                <span className="mt-0.5 block text-xs text-slate-400">{t(lang, "validateAllHint")}</span>
+              </span>
+            </label>
+            {!validateAll && (
+              <form className="flex gap-2" onSubmit={(e) => { e.preventDefault(); saveThreshold(); }}>
+                <input type="number" inputMode="numeric" step="1000" min="1" value={threshold} onChange={(e) => setThreshold(e.target.value)} className="input" placeholder="100000" aria-label={t(lang, "thresholdSetting")} />
+                <button type="submit" className="btn-primary shrink-0">{t(lang, "update")}</button>
+              </form>
+            )}
           </Section>
         )}
 

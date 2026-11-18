@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { onCloudReachabilityChange, supabase } from "./supabase";
-import { countPending, db, purgeEspaceLocal, type Dirty, type LocalTransaction, type Role } from "./db";
+import { countPending, db, purgeEspaceLocal, type Dirty, type LocalEvent, type LocalTransaction, type Role } from "./db";
 
 /**
  * Synchronisation hors-ligne ↔ Supabase.
@@ -86,7 +86,7 @@ export function SyncProvider({ userId, enabled, children }: { userId: string | n
       // Colonne / table / fonction inconnue : la base en ligne n'a pas reçu les migrations.
       const outdated = /does not exist|could not find the (function|table)|schema cache/i.test(raw);
       const msg = outdated
-        ? `Base en ligne pas à jour : exécutez supabase/sql-editor/appliquer-mises-a-jour-2026-11-18.sql dans Supabase → SQL Editor. Vos saisies restent sur l'appareil. (${raw})`
+        ? `Base en ligne pas à jour : exécutez, dans l'ordre, les fichiers du dossier supabase/sql-editor dans Supabase → SQL Editor. Vos saisies restent sur l'appareil. (${raw})`
         : raw;
       setState((s) => ({ ...s, error: msg }));
     } finally {
@@ -135,6 +135,31 @@ export function SyncProvider({ userId, enabled, children }: { userId: string | n
       window.removeEventListener("mtantana:data-changed", onChange);
     };
   }, [sync, refreshPending]);
+
+  // Temps réel : nouvel événement dans un de mes espaces (ordre émis, saisie à
+  // valider…) → enregistré, annoncé (mtantana:event) et synchro des données.
+  useEffect(() => {
+    if (!enabled || !userId) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const channel = supabase
+      .channel(`evenements-${userId}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "evenements" }, async (payload) => {
+        try {
+          const ev = eventFromRemote(payload.new as Row);
+          await db.evenements.put(ev);
+          window.dispatchEvent(new CustomEvent<LocalEvent>("mtantana:event", { detail: ev }));
+        } catch {
+          /* base fermée (déconnexion) */
+        }
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => sync(), 800);
+      })
+      .subscribe();
+    return () => {
+      if (timer) clearTimeout(timer);
+      supabase.removeChannel(channel);
+    };
+  }, [enabled, userId, sync]);
 
   // Retour sur l'onglet + rafraîchissement périodique (5 min)
   useEffect(() => {
@@ -218,6 +243,7 @@ async function runSync(uid: string): Promise<string[]> {
   await pullTransactions(espaceIds);
   await pullSimple(espaceIds);
   await pullCategories();
+  await pullEvents(espaceIds);
   return warnings;
 }
 
@@ -239,7 +265,7 @@ export async function acceptInvitations(): Promise<number> {
 }
 
 async function syncMemberships(uid: string): Promise<string[]> {
-  const { data: mine, error } = await supabase.from("user_espaces").select("espace_id, role_dans_espace").eq("user_id", uid);
+  const { data: mine, error } = await supabase.from("user_espaces").select("espace_id, role_dans_espace, fonction").eq("user_id", uid);
   if (error) throw new Error(error.message);
   const espaceIds = (mine ?? []).map((r) => r.espace_id as string);
 
@@ -250,13 +276,14 @@ async function syncMemberships(uid: string): Promise<string[]> {
 
   // Tous les membres visibles (RLS : les admins voient les membres de leurs espaces)
   const { data: members } = espaceIds.length
-    ? await supabase.from("user_espaces").select("user_id, espace_id, role_dans_espace").in("espace_id", espaceIds)
+    ? await supabase.from("user_espaces").select("user_id, espace_id, role_dans_espace, fonction").in("espace_id", espaceIds)
     : { data: [] };
   const allMembers = [...(members ?? []), ...(mine ?? []).map((m) => ({ ...m, user_id: uid }))];
 
-  const userIds = [...new Set(allMembers.map((m) => m.user_id as string))];
-  const { data: profiles } = userIds.length
-    ? await supabase.from("profiles").select("id, nom, email, role, langue, actif, cree_le").in("id", userIds)
+  // Tous les profils visibles (RLS : personnes partageant un espace avec moi),
+  // pour afficher qui a saisi / validé / exécuté.
+  const { data: profiles } = espaceIds.length
+    ? await supabase.from("profiles").select("id, nom, email, role, langue, actif, cree_le")
     : { data: [] };
 
   const keep = new Set(espaceIds);
@@ -270,7 +297,12 @@ async function syncMemberships(uid: string): Promise<string[]> {
       const key = `${m.user_id}:${m.espace_id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      await db.user_espaces.add({ user_id: m.user_id as string, espace_id: m.espace_id as string, role_dans_espace: m.role_dans_espace as Role });
+      await db.user_espaces.add({
+        user_id: m.user_id as string,
+        espace_id: m.espace_id as string,
+        role_dans_espace: m.role_dans_espace as Role,
+        fonction: (m as { fonction?: string | null }).fonction ?? null,
+      });
     }
     for (const p of profiles ?? []) {
       await db.users.put({ id: p.id, nom: p.nom, email: p.email, role: p.role as Role, langue: p.langue, actif: p.actif, cree_le: p.cree_le });
@@ -300,6 +332,8 @@ function txPayload(t: LocalTransaction) {
     modifie_le: t.modifie_le ?? null,
     supprime: t.supprime,
     espace_id: t.espace_id,
+    ordre_id: t.ordre_id ?? null,
+    motif_refus: t.motif_refus ?? null,
   };
 }
 
@@ -345,6 +379,7 @@ async function pushTransactions(uid: string, espaceIds: string[], warnings: stri
         statut: t.statut,
         modifie_le: t.modifie_le ?? null,
         supprime: t.supprime,
+        motif_refus: t.motif_refus ?? null,
       })
       .eq("client_uuid", t.client_uuid);
     if (error && !isRejection(error)) throw new Error(error.message);
@@ -401,16 +436,22 @@ const SIMPLE: SimpleSpec[] = [
     local: "scheduled",
     remote: "transactions_planifiees",
     conflict: "id",
-    columns: "id, espace_id, titre, motif, type_operation, montant_prevu, categorie, date_prevue, statut, delai_alerte_jours, auteur_id, cree_le",
+    columns:
+      "id, espace_id, titre, motif, type_operation, montant_prevu, categorie, date_prevue, statut, delai_alerte_jours, auteur_id, cree_le, assigne_a, realisee_par, realisee_le, transaction_client_uuid, annulee_par, annulee_le, motif_annulation",
+    // Les champs de trace (realisee_*, annulee_par…) sont écrits par le serveur.
     toRemote: (r) => ({
       id: r.uuid, espace_id: r.espace_id, titre: r.titre, motif: r.motif, type_operation: r.type_operation,
       montant_prevu: r.montant, categorie: r.categorie, date_prevue: r.date_prevue, statut: r.statut,
       delai_alerte_jours: r.alerte_jours_avant, auteur_id: r.auteur_id, cree_le: r.cree_le,
+      assigne_a: r.assigne_a ?? null, motif_annulation: r.motif_annulation ?? null,
     }),
     fromRemote: (r) => ({
       uuid: r.id, espace_id: r.espace_id, titre: r.titre, motif: r.motif, type_operation: r.type_operation,
       montant: Number(r.montant_prevu), categorie: r.categorie, date_prevue: r.date_prevue, statut: r.statut,
       alerte_jours_avant: r.delai_alerte_jours, auteur_id: r.auteur_id, cree_le: r.cree_le,
+      assigne_a: r.assigne_a ?? null, realisee_par: r.realisee_par ?? null, realisee_le: r.realisee_le ?? null,
+      transaction_client_uuid: r.transaction_client_uuid ?? null, annulee_par: r.annulee_par ?? null,
+      annulee_le: r.annulee_le ?? null, motif_annulation: r.motif_annulation ?? null,
     }),
   },
 ];
@@ -470,7 +511,7 @@ async function pushCategories(warnings: string[]) {
 async function pullTransactions(espaceIds: string[]) {
   const cloud = await fetchAll(
     "transactions",
-    "id, client_uuid, date_transaction, motif, type_operation, montant, categorie, statut, auteur_id, cree_le, modifie_le, supprime, espace_id",
+    "id, client_uuid, date_transaction, motif, type_operation, montant, categorie, statut, auteur_id, cree_le, modifie_le, supprime, espace_id, ordre_id, valide_par, valide_le, supprime_par, motif_refus",
     espaceIds,
   );
   const cloudUuids = new Set(cloud.map((t) => t.client_uuid as string));
@@ -495,6 +536,11 @@ async function pullTransactions(espaceIds: string[]) {
         modifie_le: (tx.modifie_le as string | null) ?? null,
         supprime: Boolean(tx.supprime),
         espace_id: tx.espace_id as string,
+        ordre_id: (tx.ordre_id as string | null) ?? null,
+        valide_par: (tx.valide_par as string | null) ?? null,
+        valide_le: (tx.valide_le as string | null) ?? null,
+        supprime_par: (tx.supprime_par as string | null) ?? null,
+        motif_refus: (tx.motif_refus as string | null) ?? null,
         dirty: 0,
       };
       if (existing?.id) await db.transactions.update(existing.id, row);
@@ -538,6 +584,50 @@ async function pullSimple(espaceIds: string[]) {
       else await db.settings.add({ cle: s.cle, valeur: s.valeur, espace_id: s.espace_id, dirty: 0 });
     }
   });
+}
+
+const EVENT_COLUMNS = "id, espace_id, type, acteur_id, acteur_nom, acteur_fonction, cible_id, titre, montant, type_operation, ref_table, ref_id, details, cree_le";
+const EVENTS_KEPT_PER_ESPACE = 500;
+
+export function eventFromRemote(r: Row): LocalEvent {
+  return {
+    id: r.id as string,
+    espace_id: r.espace_id as string,
+    type: r.type as string,
+    acteur_id: (r.acteur_id as string | null) ?? null,
+    acteur_nom: (r.acteur_nom as string | null) ?? null,
+    acteur_fonction: (r.acteur_fonction as string | null) ?? null,
+    cible_id: (r.cible_id as string | null) ?? null,
+    titre: (r.titre as string) ?? "",
+    montant: r.montant == null ? null : Number(r.montant),
+    type_operation: (r.type_operation as LocalEvent["type_operation"]) ?? null,
+    ref_table: (r.ref_table as string | null) ?? null,
+    ref_id: (r.ref_id as string | null) ?? null,
+    details: (r.details as Record<string, unknown> | null) ?? null,
+    cree_le: r.cree_le as string,
+  };
+}
+
+/** Événements récents (incrémental). Silencieux si la migration n'est pas appliquée. */
+async function pullEvents(espaceIds: string[]) {
+  for (const espaceId of espaceIds) {
+    const last = await db.evenements.where("[espace_id+cree_le]").between([espaceId, ""], [espaceId, "\uffff"]).last();
+    let q = supabase.from("evenements").select(EVENT_COLUMNS).eq("espace_id", espaceId).order("cree_le", { ascending: false }).limit(EVENTS_KEPT_PER_ESPACE);
+    // Petite marge : des événements de la même seconde peuvent arriver en retard.
+    if (last) q = q.gte("cree_le", new Date(new Date(last.cree_le).getTime() - 60_000).toISOString());
+    const { data, error } = await q;
+    if (error) {
+      if (/does not exist|could not find the table|schema cache/i.test(error.message)) return;
+      throw new Error(`evenements : ${error.message}`);
+    }
+    if (data?.length) await db.evenements.bulkPut(data.map(eventFromRemote));
+    // On ne garde que les plus récents sur l'appareil.
+    const count = await db.evenements.where("espace_id").equals(espaceId).count();
+    if (count > EVENTS_KEPT_PER_ESPACE) {
+      const old = await db.evenements.where("[espace_id+cree_le]").between([espaceId, ""], [espaceId, "\uffff"]).limit(count - EVENTS_KEPT_PER_ESPACE).primaryKeys();
+      await db.evenements.bulkDelete(old);
+    }
+  }
 }
 
 async function pullCategories() {
