@@ -4,7 +4,7 @@ import { Wallet, Mail, ArrowRight, AlertCircle, ExternalLink, User, WifiOff, Che
 import { PasswordInput, StrengthMeter } from "@/components/PasswordFields";
 import { useAuth, googleLoginEnabled, MIN_PASSWORD_LENGTH } from "@/lib/auth";
 import { t, type Lang } from "@/lib/i18n";
-import { pingCloud } from "@/lib/supabase";
+import { cloudDiagnostic, pingCloud } from "@/lib/supabase";
 
 interface Props {
   mode: "login" | "signup" | "forgot";
@@ -163,6 +163,9 @@ export function AuthPage({ mode }: Props) {
           <div>
             <div className="font-semibold">{t(lang, cloudStatus === "unconfigured" ? "cloudUnconfiguredTitle" : "cloudUnreachableTitle")}</div>
             <div className="mt-1 text-amber-200/80">{t(lang, cloudStatus === "unconfigured" ? "cloudUnconfiguredHint" : "cloudUnreachableHint")}</div>
+            {cloudStatus === "unreachable" && (
+              <div className="mt-2 break-all font-mono text-[11px] text-amber-200/60">{cloudDiagnostic()}</div>
+            )}
             {cloudStatus === "unreachable" && (
               <button type="button" onClick={() => pingCloud()} className="mt-2 text-xs font-semibold text-amber-100 underline underline-offset-2">
                 {t(lang, "retry")}

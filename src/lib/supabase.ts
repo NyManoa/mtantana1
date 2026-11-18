@@ -1,7 +1,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const url = (import.meta.env.VITE_SUPABASE_URL ?? "").trim();
-const anonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
+const url = (import.meta.env.VITE_SUPABASE_URL ?? "").trim().replace(/^["']|["']$/g, "").replace(/\/+$/, "");
+const anonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim().replace(/^["']|["']$/g, "");
 
 /**
  * false si l'URL ou la clé Supabase manquent : l'application démarre quand
@@ -17,6 +17,25 @@ if (!cloudConfigured) {
 const REQUEST_TIMEOUT_MS = 12_000;
 
 let reachable = true;
+let lastProblem = "";
+
+/** Détail technique de la dernière panne (affiché dans le bandeau pour le diagnostic). */
+export function cloudDiagnostic(): string {
+  let host = "(aucune adresse)";
+  try {
+    host = new URL(url).host;
+  } catch {
+    host = url ? `adresse invalide « ${url.slice(0, 60)} »` : host;
+  }
+  return `Serveur : ${host}${lastProblem ? ` — ${lastProblem}` : ""}`;
+}
+
+function describe(err: unknown): string {
+  if (err instanceof DOMException && err.name === "AbortError") return "pas de réponse (délai dépassé)";
+  const m = err instanceof Error ? err.message : String(err);
+  // Chrome/Firefox : « Failed to fetch » / « NetworkError » = DNS, CORS, CSP ou réseau.
+  return `requête bloquée ou réseau (${m})${navigator.onLine ? " — voir la console du navigateur (F12)" : ""}`;
+}
 const listeners = new Set<(ok: boolean) => void>();
 
 function setReachable(ok: boolean) {
@@ -45,9 +64,12 @@ const fetchWithTimeout: typeof fetch = async (input, init) => {
   try {
     const res = await fetch(input, { ...init, signal: ctrl.signal });
     // 5xx de la passerelle (projet en pause, maintenance) = serveur indisponible.
-    setReachable(!(res.status === 502 || res.status === 503 || res.status === 504 || res.status === 540));
+    const down = res.status === 502 || res.status === 503 || res.status === 504 || res.status === 540;
+    if (down) lastProblem = `HTTP ${res.status}`;
+    setReachable(!down);
     return res;
   } catch (err) {
+    lastProblem = describe(err);
     setReachable(false);
     throw err;
   } finally {
@@ -59,7 +81,7 @@ const fetchWithTimeout: typeof fetch = async (input, init) => {
  * Vérifie rapidement si le serveur répond (utilisé au démarrage).
  * Ne lève jamais d'erreur.
  */
-export async function pingCloud(timeoutMs = 4000): Promise<boolean> {
+export async function pingCloud(timeoutMs = 8000): Promise<boolean> {
   if (!cloudConfigured) return false;
   if (!navigator.onLine) return false;
   const ctrl = new AbortController();
@@ -67,9 +89,12 @@ export async function pingCloud(timeoutMs = 4000): Promise<boolean> {
   try {
     const res = await fetch(`${url}/auth/v1/health`, { headers: { apikey: anonKey }, signal: ctrl.signal });
     const ok = res.status < 500;
+    if (!ok) lastProblem = `HTTP ${res.status}`;
     setReachable(ok);
     return ok;
-  } catch {
+  } catch (err) {
+    lastProblem = describe(err);
+    console.warn("[supabase] serveur injoignable :", cloudDiagnostic(), err);
     setReachable(false);
     return false;
   } finally {

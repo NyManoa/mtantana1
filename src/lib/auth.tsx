@@ -212,7 +212,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // En parallèle : si le serveur est injoignable (DNS, pause), inutile
         // d'attendre que Supabase abandonne le rafraîchissement du jeton.
         const DOWN = Symbol("down");
-        const down = savedMode === "cloud" ? pingCloud(3000).then((ok) => (ok ? new Promise<never>(() => {}) : DOWN)) : new Promise<never>(() => {});
+        const down = savedMode === "cloud" ? pingCloud(6000).then((ok) => (ok ? new Promise<never>(() => {}) : DOWN)) : new Promise<never>(() => {});
         const res = await Promise.race([withTimeout(supabase.auth.getSession(), 5000), down]);
         if (res === DOWN) {
           await openFromCache();
