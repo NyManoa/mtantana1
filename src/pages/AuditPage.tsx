@@ -20,8 +20,9 @@ interface AuditEntry {
 }
 
 export function AuditPage() {
-  const { lang } = useAuth();
+  const { lang, mode } = useAuth();
   const { currentEspace } = useEspace();
+  const [cached, setCached] = useState(false);
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [allUsers, setAllUsers] = useState<{ id: string; nom: string }[]>([]);
   const [loading, setLoading] = useState(true);
@@ -36,49 +37,49 @@ export function AuditPage() {
     setLoading(true);
     if (!currentEspace) { setLoading(false); return; }
 
-    let rows: import("@/lib/db").LocalAudit[];
-    rows = await db.journal_audit.where("espace_id").equals(currentEspace.id).reverse().sortBy("date_action");
-
-    if (navigator.onLine) {
-      try {
-        const { data: cloudAudit, error } = await supabase
-          .from("journal_audit")
-          .select("id, action, table_concernee, enregistrement_id, ancienne_valeur, nouvelle_valeur, auteur_id, date_action, espace_id")
-          .eq("espace_id", currentEspace.id)
-          .order("date_action", { ascending: false })
-          .limit(500);
-
-        if (!error && cloudAudit) {
-          for (const a of cloudAudit) {
-            const existing = await db.journal_audit
-              .where("espace_id").equals(currentEspace.id)
-              .and((row) => row.enregistrement_id === a.enregistrement_id && row.date_action === a.date_action)
-              .first();
-            if (!existing) {
-              await db.journal_audit.add({
-                action: a.action,
-                table_concernee: a.table_concernee,
-                enregistrement_id: a.enregistrement_id,
-                ancienne_valeur: a.ancienne_valeur,
-                nouvelle_valeur: a.nouvelle_valeur,
-                auteur_id: a.auteur_id,
-                date_action: a.date_action,
-                espace_id: a.espace_id,
-              });
-            }
-          }
-          rows = await db.journal_audit.where("espace_id").equals(currentEspace.id).reverse().sortBy("date_action");
-        }
-      } catch {
-        // fall back to local only
-      }
-    }
-
     const users = await db.users.toArray();
     const profileMap = new Map<string, string>();
     for (const u of users) profileMap.set(u.id, u.nom);
-    setAllUsers(users.map(u => ({ id: u.id, nom: u.nom })));
-    setEntries(rows.slice(0, 500).map(r => ({
+    setAllUsers(users.map((u) => ({ id: u.id, nom: u.nom })));
+
+    // Mode cloud : le journal fait foi côté serveur (écrit par trigger, non falsifiable).
+    if (mode === "cloud" && navigator.onLine) {
+      const { data, error } = await supabase
+        .from("journal_audit")
+        .select("id, transaction_id, utilisateur_id, action, ancienne_valeur, nouvelle_valeur, horodatage")
+        .eq("espace_id", currentEspace.id)
+        .order("horodatage", { ascending: false })
+        .limit(500);
+      if (!error && data) {
+        const rows: AuditEntry[] = data.map((a, i) => ({
+          id: i,
+          enregistrement_id: (a.transaction_id as string) ?? "",
+          auteur_id: a.utilisateur_id as string,
+          action: a.action as AuditEntry["action"],
+          ancienne_valeur: a.ancienne_valeur ? JSON.stringify(a.ancienne_valeur) : null,
+          nouvelle_valeur: a.nouvelle_valeur ? JSON.stringify(a.nouvelle_valeur) : null,
+          date_action: a.horodatage as string,
+          auteur_nom: profileMap.get(a.utilisateur_id as string),
+        }));
+        setEntries(rows);
+        setCached(false);
+        // Copie locale pour consultation hors ligne.
+        await db.transaction("rw", db.journal_audit, async () => {
+          await db.journal_audit.where("espace_id").equals(currentEspace.id).delete();
+          await db.journal_audit.bulkAdd(rows.map((r) => ({
+            action: r.action, table_concernee: "transactions", enregistrement_id: r.enregistrement_id,
+            ancienne_valeur: r.ancienne_valeur, nouvelle_valeur: r.nouvelle_valeur, auteur_id: r.auteur_id,
+            date_action: r.date_action, espace_id: currentEspace.id,
+          })));
+        });
+        setLoading(false);
+        return;
+      }
+    }
+
+    const rows = await db.journal_audit.where("espace_id").equals(currentEspace.id).reverse().sortBy("date_action");
+    setCached(mode === "cloud");
+    setEntries(rows.slice(0, 500).map((r) => ({
       id: r.id!,
       enregistrement_id: r.enregistrement_id,
       auteur_id: r.auteur_id,
@@ -89,7 +90,7 @@ export function AuditPage() {
       auteur_nom: profileMap.get(r.auteur_id),
     })));
     setLoading(false);
-  }, [currentEspace]);
+  }, [currentEspace, mode]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -143,7 +144,7 @@ export function AuditPage() {
   };
 
   return (
-    <Layout title={t(lang, "auditLog")} subtitle={t(lang, "auditLog")}>
+    <Layout title={t(lang, "auditLog")} subtitle={cached ? `${t(lang, "offline")} · ${t(lang, "localOnly")}` : currentEspace?.nom}>
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="relative flex-1 max-w-md">
           <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />

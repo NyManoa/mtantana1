@@ -4,7 +4,8 @@ import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { useEspace } from "@/lib/espace";
 import { useTransactions } from "@/lib/useTransactions";
-import { db } from "@/lib/db";
+import { db, dirtyFlag, genId, notifyDataChanged, removeDirty, updateDirty } from "@/lib/db";
+import { useDataVersion } from "@/lib/sync";
 import { t, categoryLabel } from "@/lib/i18n";
 import { formatAriary, currentMonthYear, monthLabel } from "@/lib/format";
 import { ProgressBar } from "@/components/charts/ProgressBar";
@@ -18,26 +19,27 @@ interface Budget {
 
 export function BudgetsPage() {
   const { profile, lang } = useAuth();
-  const { currentEspace } = useEspace();
+  const { currentEspace, role } = useEspace();
+  const version = useDataVersion();
   const { transactions, categories } = useTransactions();
   const [budgets, setBudgets] = useState<Budget[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
-  const [bCat, setBCat] = useState("nourriture");
+  const [bCat, setBCat] = useState("autre");
   const [bMonth, setBMonth] = useState(currentMonthYear());
   const [bLimit, setBLimit] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  const isAdmin = profile?.role === "admin";
+  const isAdmin = role === "admin";
 
   const loadBudgets = useCallback(async () => {
     if (!currentEspace) { setLoading(false); return; }
     const rows = await db.budgets.where("espace_id").equals(currentEspace.id).reverse().sortBy("mois_annee");
-    setBudgets(rows as Budget[]);
+    setBudgets(rows.filter((b) => !b.deleted) as Budget[]);
     setLoading(false);
   }, [currentEspace]);
 
-  useEffect(() => { loadBudgets(); }, [loadBudgets]);
+  useEffect(() => { loadBudgets(); }, [loadBudgets, version]);
 
   const spentByCategory = (cat: string, month: string) => {
     return transactions
@@ -48,18 +50,16 @@ export function BudgetsPage() {
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!profile || !currentEspace) return;
+    const limite = parseFloat(bLimit);
+    if (!Number.isFinite(limite) || limite < 0 || !/^\d{4}-\d{2}$/.test(bMonth)) return;
     setSubmitting(true);
     const existing = await db.budgets.where("espace_id").equals(currentEspace.id).toArray();
     const found = existing.find(b => b.categorie === bCat && b.mois_annee === bMonth);
     if (found?.id) {
-      await db.budgets.update(found.id, { limite: parseFloat(bLimit) });
+      await updateDirty("budgets", found.id, { limite, deleted: false });
     } else {
-      await db.budgets.add({
-        categorie: bCat,
-        mois_annee: bMonth,
-        limite: parseFloat(bLimit),
-        espace_id: currentEspace.id,
-      });
+      await db.budgets.add({ uuid: genId(), categorie: bCat, mois_annee: bMonth, limite, espace_id: currentEspace.id, dirty: dirtyFlag() });
+      notifyDataChanged();
     }
     setModalOpen(false);
     setBLimit("");
@@ -68,8 +68,8 @@ export function BudgetsPage() {
   };
 
   const handleDelete = async (id: number) => {
-    await db.budgets.delete(id);
-    loadBudgets();
+    if (!window.confirm(t(lang, "confirmDelete"))) return;
+    await removeDirty("budgets", id);
   };
 
   return (
@@ -154,7 +154,7 @@ export function BudgetsPage() {
               </div>
               <div>
                 <label className="input-label">{t(lang, "budgetLimit")} (Ar)</label>
-                <input type="number" step="0.01" min="0" value={bLimit} onChange={(e) => setBLimit(e.target.value)} placeholder="0" className="input" />
+                <input type="number" inputMode="decimal" step="any" min="0" required value={bLimit} onChange={(e) => setBLimit(e.target.value)} placeholder="0" className="input" />
               </div>
               <button type="submit" disabled={submitting} className="btn-primary w-full">{submitting ? t(lang, "loading") : t(lang, "save")}</button>
             </form>

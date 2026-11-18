@@ -1,0 +1,58 @@
+# Évite la mise en pause automatique du projet Supabase gratuit
+# (pause après ~7 jours sans activité).
+#
+# Tous les 3 jours, appelle la fonction SQL `public.keepalive()` (migration
+# 20261118130000_invitations_keepalive.sql), qui fait une petite écriture en
+# base. Aucune donnée n'est lue ni exposée.
+#
+# Configuration (une fois) : GitHub → Settings → Secrets and variables → Actions
+#   SUPABASE_URL       = https://<ref>.supabase.co
+#   SUPABASE_ANON_KEY  = clé « anon » (publique) — JAMAIS la clé service_role
+#
+# Test immédiat : onglet Actions → « Supabase keep-alive » → Run workflow.
+
+name: Supabase keep-alive
+
+on:
+  schedule:
+    - cron: "17 6 */3 * *" # 06:17 UTC (09:17 à Madagascar), tous les 3 jours
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Appeler keepalive()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::error::Secrets SUPABASE_URL / SUPABASE_ANON_KEY manquants (Settings → Secrets → Actions)."
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/resp.txt -w '%{http_code}' --max-time 30 \
+              -X POST "${SUPABASE_URL%/}/rest/v1/rpc/keepalive" \
+              -H "apikey: ${SUPABASE_ANON_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+              -H "Content-Type: application/json" \
+              -d '{}' || echo 000)
+            echo "Tentative $attempt : HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "Projet actif ✔"
+              exit 0
+            fi
+            if [ "$code" = "404" ]; then
+              echo "::error::Fonction keepalive() introuvable : appliquez la migration (supabase db push)."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::Le projet ne répond pas (déjà en pause ?). Restaurez-le depuis le tableau de bord Supabase."
+          cat /tmp/resp.txt || true
+          exit 1

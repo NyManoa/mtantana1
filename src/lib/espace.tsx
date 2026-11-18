@@ -1,236 +1,196 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { db, genId, type LocalEspace } from "./db";
-import { supabase } from "./supabase";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { db, genId, notifyDataChanged, purgeEspaceLocal, type Role } from "./db";
+import { isCloudReachable, supabase } from "./supabase";
+import { acceptInvitations } from "./sync";
 import { useAuth } from "./auth";
 
 export interface Espace {
   id: string;
   nom: string;
   cree_le: string;
-  role_dans_espace: string;
+  role_dans_espace: Role;
 }
+
+type Result = { error: string | null };
 
 interface EspaceContextValue {
   espaces: Espace[];
   currentEspace: Espace | null;
+  /** Rôle de l'utilisateur DANS l'espace courant (c'est lui qui donne les droits). */
+  role: Role;
   setCurrentEspace: (e: Espace | null) => void;
   loading: boolean;
   refresh: () => Promise<void>;
-  addEspaceOptimistic: (e: Espace) => void;
-  createEspace: (nom: string) => Promise<{ error: string | null }>;
-  deleteEspace: (espaceId: string) => Promise<{ error: string | null }>;
-  resetEspace: (espaceId: string) => Promise<{ error: string | null }>;
-  renameEspace: (espaceId: string, nouveauNom: string) => Promise<{ error: string | null }>;
+  createEspace: (nom: string) => Promise<Result>;
+  deleteEspace: (espaceId: string) => Promise<Result>;
+  resetEspace: (espaceId: string) => Promise<Result>;
+  renameEspace: (espaceId: string, nouveauNom: string) => Promise<Result>;
 }
 
 const EspaceContext = createContext<EspaceContextValue | undefined>(undefined);
+const currentKey = (uid: string) => `mtantana_current_espace_${uid}`;
+const NEED_ONLINE = "Connexion Internet requise pour cette action";
+
+function rpcError(message: string): string {
+  if (message.includes("Accès refusé") || message.includes("42501")) return "Vous n'êtes pas administrateur de cet espace";
+  return message;
+}
 
 export function EspaceProvider({ children }: { children: ReactNode }) {
-  const { profile } = useAuth();
+  const { profile, mode } = useAuth();
   const [espaces, setEspaces] = useState<Espace[]>([]);
   const [currentEspace, setCurrentEspaceState] = useState<Espace | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const loadEspaces = async () => {
+  const loadEspaces = useCallback(async () => {
     if (!profile) {
       setEspaces([]);
       setCurrentEspaceState(null);
       setLoading(false);
       return;
     }
+    const showLocal = async () => {
+      const memberships = await db.user_espaces.where("user_id").equals(profile.id).toArray();
+      const all = await db.espaces.bulkGet(memberships.map((m) => m.espace_id));
+      const list: Espace[] = memberships
+        .map((m, i) => (all[i] ? { ...all[i]!, role_dans_espace: m.role_dans_espace } : null))
+        .filter((e): e is Espace => e !== null)
+        .sort((a, b) => a.cree_le.localeCompare(b.cree_le));
+      setEspaces(list);
+      const stored = localStorage.getItem(currentKey(profile.id));
+      setCurrentEspaceState((prev) => list.find((e) => e.id === (prev?.id ?? stored)) ?? list.find((e) => e.id === stored) ?? list[0] ?? null);
+    };
 
-    setLoading(true);
+    // 1. Affichage immédiat depuis l'appareil (jamais bloqué par le réseau).
     try {
-      // Try cloud first
-      if (navigator.onLine) {
-        const { data: cloudUE, error } = await supabase
+      await showLocal();
+    } catch (err) {
+      console.error("[espace] chargement local", err);
+    }
+
+    // 2. Mise à jour depuis le cloud s'il répond.
+    try {
+      if (mode === "cloud" && navigator.onLine && isCloudReachable()) {
+        const hadLocal = (await db.user_espaces.where("user_id").equals(profile.id).count()) > 0;
+        // Premier démarrage sur cet appareil : on attend la liste ; sinon on ne bloque pas l'écran.
+        if (hadLocal) setLoading(false);
+        await acceptInvitations();
+        const { data: mine, error } = await supabase
           .from("user_espaces")
-          .select("user_id, espace_id, role_dans_espace")
+          .select("espace_id, role_dans_espace, espaces(id, nom, cree_le)")
           .eq("user_id", profile.id);
-
-        if (!error && cloudUE && cloudUE.length > 0) {
-          const espaceIds = cloudUE.map((ue) => ue.espace_id);
-          const { data: cloudEspaces } = await supabase
-            .from("espaces")
-            .select("id, nom, cree_le")
-            .in("id", espaceIds);
-
-          if (cloudEspaces) {
-            // Update local cache
-            for (const e of cloudEspaces) {
-              await db.espaces.put({ id: e.id, nom: e.nom, cree_le: e.cree_le });
+        if (!error && mine) {
+          const ids = new Set(mine.map((m) => m.espace_id as string));
+          await db.transaction("rw", [db.espaces, db.user_espaces], async () => {
+            for (const m of mine) {
+              const e = m.espaces as unknown as { id: string; nom: string; cree_le: string } | null;
+              if (e) await db.espaces.put({ id: e.id, nom: e.nom, cree_le: e.cree_le });
             }
-            for (const ue of cloudUE) {
-              const existing = await db.user_espaces
-                .where("user_id").equals(ue.user_id)
-                .and((row) => row.espace_id === ue.espace_id)
-                .first();
-              if (!existing) {
-                await db.user_espaces.add({
-                  user_id: ue.user_id,
-                  espace_id: ue.espace_id,
-                  role_dans_espace: ue.role_dans_espace as "operateur" | "admin" | "superviseur",
-                });
-              }
+            await db.user_espaces.where("user_id").equals(profile.id).delete();
+            for (const m of mine) {
+              await db.user_espaces.add({ user_id: profile.id, espace_id: m.espace_id as string, role_dans_espace: m.role_dans_espace as Role });
             }
+          });
+          for (const e of await db.espaces.toArray()) {
+            if (!ids.has(e.id)) await purgeEspaceLocal(e.id);
           }
+          await showLocal();
         }
       }
-
-      // Load from local (serves as cache and offline fallback)
-      const userEspaces = await db.user_espaces.where("user_id").equals(profile.id).toArray();
-      if (userEspaces.length === 0) {
-        setEspaces([]);
-        setCurrentEspaceState(null);
-        setLoading(false);
-        return;
-      }
-
-      const espaceIds = userEspaces.map((ue) => ue.espace_id);
-      const allEspaces = await db.espaces.toArray();
-      const list: Espace[] = allEspaces
-        .filter((e: LocalEspace) => espaceIds.includes(e.id))
-        .map((e) => ({
-          id: e.id,
-          nom: e.nom,
-          cree_le: e.cree_le,
-          role_dans_espace: userEspaces.find((ue) => ue.espace_id === e.id)?.role_dans_espace ?? "operateur",
-        }));
-
-      setEspaces(list);
-
-      const stored = localStorage.getItem("currentEspaceId");
-      const found = list.find((e) => e.id === stored);
-      setCurrentEspaceState(found ?? list[0] ?? null);
     } catch (err) {
-      console.error("[espace] loadEspaces error:", err);
-      setEspaces([]);
-      setCurrentEspaceState(null);
+      console.error("[espace] chargement cloud", err);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-  };
+  }, [profile, mode]);
 
   useEffect(() => {
+    setLoading(true);
     loadEspaces();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile?.id]);
+  }, [loadEspaces]);
 
+  // Les appartenances peuvent changer à chaque synchro (ajout / retrait par un admin).
   useEffect(() => {
-    if (loading) {
-      const timer = setTimeout(() => setLoading(false), 5000);
-      return () => clearTimeout(timer);
-    }
-  }, [loading]);
+    const onSynced = () => loadEspaces();
+    window.addEventListener("mtantana:synced", onSynced);
+    return () => window.removeEventListener("mtantana:synced", onSynced);
+  }, [loadEspaces]);
 
   const setCurrentEspace = (e: Espace | null) => {
     setCurrentEspaceState(e);
-    if (e) localStorage.setItem("currentEspaceId", e.id);
-    else localStorage.removeItem("currentEspaceId");
+    if (!profile) return;
+    if (e) localStorage.setItem(currentKey(profile.id), e.id);
+    else localStorage.removeItem(currentKey(profile.id));
   };
 
-  const refresh = async () => { await loadEspaces(); };
-
-  const addEspaceOptimistic = (e: Espace) => {
-    setEspaces((prev) => {
-      if (prev.some((p) => p.id === e.id)) return prev;
-      return [...prev, e];
-    });
-    setCurrentEspaceState(e);
-    localStorage.setItem("currentEspaceId", e.id);
-  };
-
-  const createEspace = async (nom: string): Promise<{ error: string | null }> => {
+  const createEspace = async (nom: string): Promise<Result> => {
     if (!profile) return { error: "Non connecté" };
-    if (!nom.trim()) return { error: "Nom requis" };
-    const id = genId();
-    const now = new Date().toISOString();
+    const clean = nom.trim().slice(0, 100);
+    if (!clean) return { error: "Nom requis" };
 
-    await db.espaces.add({ id, nom: nom.trim(), cree_le: now });
-    await db.user_espaces.add({
-      user_id: profile.id,
-      espace_id: id,
-      role_dans_espace: "admin",
-    });
-
-    if (navigator.onLine) {
-      const { error: espErr } = await supabase
-        .from("espaces")
-        .insert({ id, nom: nom.trim(), cree_le: now, cree_par: profile.id });
-      if (espErr) return { error: espErr.message };
-
-      const { error: ueErr } = await supabase
-        .from("user_espaces")
-        .insert({ user_id: profile.id, espace_id: id, role_dans_espace: "admin" });
-      if (ueErr) return { error: ueErr.message };
+    let created: Espace;
+    if (mode === "cloud") {
+      if (!navigator.onLine) return { error: NEED_ONLINE };
+      const { data, error } = await supabase.rpc("create_espace", { p_nom: clean });
+      if (error) return { error: rpcError(error.message) };
+      const row = (Array.isArray(data) ? data[0] : data) as { id: string; nom: string; cree_le: string } | null;
+      if (!row) return { error: "Création impossible" };
+      created = { id: row.id, nom: row.nom, cree_le: row.cree_le, role_dans_espace: "admin" };
+    } else {
+      created = { id: genId(), nom: clean, cree_le: new Date().toISOString(), role_dans_espace: "admin" };
     }
 
-    addEspaceOptimistic({ id, nom: nom.trim(), cree_le: now, role_dans_espace: "admin" });
+    await db.espaces.put({ id: created.id, nom: created.nom, cree_le: created.cree_le });
+    await db.user_espaces.add({ user_id: profile.id, espace_id: created.id, role_dans_espace: "admin" });
+    setEspaces((prev) => [...prev, created]);
+    setCurrentEspace(created);
     return { error: null };
   };
 
-  const deleteEspace = async (espaceId: string): Promise<{ error: string | null }> => {
-    const allEspaces = await db.user_espaces.where("espace_id").equals(espaceId).count();
-    if (allEspaces <= 1) return { error: "Impossible de supprimer le dernier espace" };
-
-    await db.transactions.where("espace_id").equals(espaceId).delete();
-    await db.budgets.where("espace_id").equals(espaceId).delete();
-    await db.alertes.where("espace_id").equals(espaceId).delete();
-    await db.journal_audit.where("espace_id").equals(espaceId).delete();
-    await db.recurring.where("espace_id").equals(espaceId).delete();
-    await db.scheduled.where("espace_id").equals(espaceId).delete();
-    await db.settings.where("espace_id").equals(espaceId).delete();
-    await db.user_espaces.where("espace_id").equals(espaceId).delete();
-    await db.espaces.where("id").equals(espaceId).delete();
-
-    if (navigator.onLine) {
-      await supabase.from("transactions").delete().eq("espace_id", espaceId);
-      await supabase.from("budgets").delete().eq("espace_id", espaceId);
-      await supabase.from("alertes").delete().eq("espace_id", espaceId);
-      await supabase.from("journal_audit").delete().eq("espace_id", espaceId);
-      await supabase.from("transactions_recurrentes").delete().eq("espace_id", espaceId);
-      await supabase.from("transactions_planifiees").delete().eq("espace_id", espaceId);
-      await supabase.from("settings").delete().eq("espace_id", espaceId);
-      await supabase.from("user_espaces").delete().eq("espace_id", espaceId);
-      await supabase.from("espaces").delete().eq("id", espaceId);
+  const deleteEspace = async (espaceId: string): Promise<Result> => {
+    if (espaces.length <= 1) return { error: "Impossible de supprimer le dernier espace" };
+    if (mode === "cloud") {
+      if (!navigator.onLine) return { error: NEED_ONLINE };
+      const { error } = await supabase.rpc("delete_espace", { p_espace_id: espaceId });
+      if (error) return { error: rpcError(error.message) };
     }
-
-    await refresh();
+    await purgeEspaceLocal(espaceId);
+    if (currentEspace?.id === espaceId) setCurrentEspace(null);
+    await loadEspaces();
+    notifyDataChanged();
     return { error: null };
   };
 
-  const resetEspace = async (espaceId: string): Promise<{ error: string | null }> => {
-    await db.transactions.where("espace_id").equals(espaceId).delete();
-    await db.budgets.where("espace_id").equals(espaceId).delete();
-    await db.alertes.where("espace_id").equals(espaceId).delete();
-    await db.journal_audit.where("espace_id").equals(espaceId).delete();
-    await db.recurring.where("espace_id").equals(espaceId).delete();
-    await db.scheduled.where("espace_id").equals(espaceId).delete();
-
-    if (navigator.onLine) {
-      await supabase.from("transactions").delete().eq("espace_id", espaceId);
-      await supabase.from("budgets").delete().eq("espace_id", espaceId);
-      await supabase.from("alertes").delete().eq("espace_id", espaceId);
-      await supabase.from("journal_audit").delete().eq("espace_id", espaceId);
-      await supabase.from("transactions_recurrentes").delete().eq("espace_id", espaceId);
-      await supabase.from("transactions_planifiees").delete().eq("espace_id", espaceId);
+  const resetEspace = async (espaceId: string): Promise<Result> => {
+    if (mode === "cloud") {
+      if (!navigator.onLine) return { error: NEED_ONLINE };
+      const { error } = await supabase.rpc("reset_espace", { p_espace_id: espaceId });
+      if (error) return { error: rpcError(error.message) };
     }
-
+    await purgeEspaceLocal(espaceId, { keepEspace: true });
+    notifyDataChanged();
     return { error: null };
   };
 
-  const renameEspace = async (espaceId: string, nouveauNom: string): Promise<{ error: string | null }> => {
-    if (!nouveauNom.trim()) return { error: "Nom requis" };
-    await db.espaces.update(espaceId, { nom: nouveauNom.trim() });
-    if (navigator.onLine) {
-      const { error } = await supabase.from("espaces").update({ nom: nouveauNom.trim() }).eq("id", espaceId);
-      if (error) return { error: error.message };
+  const renameEspace = async (espaceId: string, nouveauNom: string): Promise<Result> => {
+    const clean = nouveauNom.trim().slice(0, 100);
+    if (!clean) return { error: "Nom requis" };
+    if (mode === "cloud") {
+      if (!navigator.onLine) return { error: NEED_ONLINE };
+      const { error } = await supabase.from("espaces").update({ nom: clean }).eq("id", espaceId);
+      if (error) return { error: rpcError(error.message) };
     }
-    await refresh();
+    await db.espaces.update(espaceId, { nom: clean });
+    await loadEspaces();
     return { error: null };
   };
+
+  const role: Role = currentEspace?.role_dans_espace ?? "operateur";
 
   return (
-    <EspaceContext.Provider value={{ espaces, currentEspace, setCurrentEspace, loading, refresh, addEspaceOptimistic, createEspace, deleteEspace, resetEspace, renameEspace }}>
+    <EspaceContext.Provider
+      value={{ espaces, currentEspace, role, setCurrentEspace, loading, refresh: loadEspaces, createEspace, deleteEspace, resetEspace, renameEspace }}
+    >
       {children}
     </EspaceContext.Provider>
   );

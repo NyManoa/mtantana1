@@ -1,9 +1,9 @@
 import { useState, useRef } from "react";
-import { Upload, FileSpreadsheet, CheckCircle2, AlertCircle, X, Inbox, Download } from "lucide-react";
+import { Upload, FileSpreadsheet, CheckCircle2, AlertCircle, X, Download } from "lucide-react";
 import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { useEspace } from "@/lib/espace";
-import { db, genClientUuid } from "@/lib/db";
+import { db, dirtyFlag, genClientUuid, isLocalMode, notifyDataChanged } from "@/lib/db";
 import { parseImportFile, type ImportRow } from "@/lib/excel";
 import { t } from "@/lib/i18n";
 import { formatAriary } from "@/lib/format";
@@ -24,7 +24,7 @@ export function ImportPage() {
 
   const handleFile = (file: File) => {
     setError(null);
-    if (!file.name.endsWith(".xlsx") && !file.name.endsWith(".xls")) {
+    if (!/\.(xlsx|xls)$/i.test(file.name) || file.size > 10 * 1024 * 1024) {
       setError(t(lang, "importInvalidFile"));
       return;
     }
@@ -70,34 +70,38 @@ export function ImportPage() {
     let successCount = 0;
     const now = new Date().toISOString();
 
-    for (const row of toImport) {
-      await db.transactions.add({
-        client_uuid: genClientUuid(),
-        date_transaction: row.dateParsed!,
-        motif: row.motif,
-        type_operation: row.type_operation!,
-        montant: row.montant!,
-        categorie: "autre",
-        statut: "validee",
+    const batch = toImport.map((row) => ({
+      client_uuid: genClientUuid(),
+      date_transaction: row.dateParsed!,
+      motif: String(row.motif ?? "").slice(0, 255) || "—",
+      type_operation: row.type_operation!,
+      montant: row.montant!,
+      categorie: "autre",
+      statut: "validee" as const,
+      auteur_id: profile.id,
+      cree_le: now,
+      modifie_le: null,
+      supprime: false,
+      espace_id: currentEspace.id,
+      dirty: dirtyFlag(),
+    }));
+    await db.transactions.bulkAdd(batch);
+    successCount = batch.length;
+
+    // En mode cloud, le journal est tenu par le serveur (une entrée par ligne).
+    if (isLocalMode()) {
+      await db.journal_audit.add({
+        action: "import",
+        table_concernee: "transactions",
+        enregistrement_id: "import",
+        ancienne_valeur: null,
+        nouvelle_valeur: JSON.stringify({ fichier: fileName, lignes_importees: successCount, date: now }),
         auteur_id: profile.id,
-        cree_le: now,
-        modifie_le: null,
-        supprime: false,
+        date_action: now,
         espace_id: currentEspace.id,
       });
-      successCount++;
     }
-
-    await db.journal_audit.add({
-      action: "import",
-      table_concernee: "transactions",
-      enregistrement_id: "import",
-      ancienne_valeur: null,
-      nouvelle_valeur: JSON.stringify({ fichier: fileName, lignes_importees: successCount, date: now }),
-      auteur_id: profile.id,
-      date_action: now,
-      espace_id: currentEspace.id,
-    });
+    notifyDataChanged();
 
     showToast(t(lang, "importSuccess", { n: successCount }), "success");
     window.dispatchEvent(new CustomEvent("mtantana:reload-transactions"));

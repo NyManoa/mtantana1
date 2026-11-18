@@ -1,324 +1,266 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+// Edge function : gestion des membres d'un espace.
+//
+// Toutes les actions sont limitées aux espaces dont l'appelant est ADMIN
+// (user_espaces.role_dans_espace = 'admin'). Le rôle global du profil n'est
+// jamais utilisé pour autoriser une action.
+//
+//   GET    ?espace_id=…                       → membres + invitations en attente
+//   POST   { email, role, espace_id }
+//            → compte existant : ajouté tout de suite à l'espace
+//            → sinon : invitation en attente, acceptée automatiquement quand la
+//              personne se connecte avec cette adresse (Google ou e-mail confirmé)
+//   PUT    { user_id, espace_id, role?, nom?, langue?, actif? }
+//   DELETE ?user_id=…&espace_id=…             → retire le membre de l'espace
+//   DELETE ?invitation_id=…&espace_id=…       → annule une invitation
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
-};
+type Role = "operateur" | "superviseur" | "admin";
+const ROLES: Role[] = ["operateur", "superviseur", "admin"];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+function corsHeaders(req: Request): Record<string, string> {
+  const allowed = (Deno.env.get("ALLOWED_ORIGINS") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const origin = req.headers.get("Origin") ?? "";
+  const allowOrigin = allowed.length === 0 ? "*" : allowed.includes(origin) ? origin : allowed[0];
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+    Vary: "Origin",
+  };
+}
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+function isUuid(v: unknown): v is string {
+  return typeof v === "string" && UUID_RE.test(v);
+}
+
+async function assertEspaceAdmin(admin: SupabaseClient, callerId: string, espaceId: unknown) {
+  if (!isUuid(espaceId)) throw new HttpError(400, "espace_id invalide");
+  const { data } = await admin
+    .from("user_espaces")
+    .select("role_dans_espace")
+    .eq("user_id", callerId)
+    .eq("espace_id", espaceId)
+    .maybeSingle();
+  if (data?.role_dans_espace !== "admin") {
+    throw new HttpError(403, "Accès refusé : vous n'êtes pas administrateur de cet espace");
+  }
+  return espaceId;
+}
+
+async function countAdmins(admin: SupabaseClient, espaceId: string) {
+  const { count } = await admin
+    .from("user_espaces")
+    .select("user_id", { count: "exact", head: true })
+    .eq("espace_id", espaceId)
+    .eq("role_dans_espace", "admin");
+  return count ?? 0;
+}
 
 Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
-  }
+  const headers = { ...corsHeaders(req), "Content-Type": "application/json" };
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers });
+
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers });
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") as string;
-    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") as string;
-    const anonKey = Deno.env.get("SUPABASE_ANON_KEY") as string;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceRoleKey) throw new HttpError(500, "Configuration serveur manquante");
 
-    if (!supabaseUrl || !serviceRoleKey || !anonKey) {
-      return new Response(JSON.stringify({ error: "Configuration serveur manquante" }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+    if (!token) throw new HttpError(401, "Non authentifié");
 
-    const authHeader = req.headers.get("Authorization") ?? "";
-    const token = authHeader.replace("Bearer ", "");
-
-    const userClient = createClient(supabaseUrl, anonKey, {
-      global: { headers: { Authorization: `Bearer ${token}` } },
+    const admin = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
     });
-    const { data: userData, error: userErr } = await userClient.auth.getUser();
-    if (userErr || !userData.user) {
-      return new Response(JSON.stringify({ error: "Non authentifié" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    const { data: userData, error: userErr } = await admin.auth.getUser(token);
+    if (userErr || !userData.user) throw new HttpError(401, "Session invalide");
+    const callerId = userData.user.id;
 
-    const adminClient = createClient(supabaseUrl, serviceRoleKey);
-    const { data: callerProfile } = await adminClient
-      .from("profiles")
-      .select("role")
-      .eq("id", userData.user.id)
-      .maybeSingle();
+    const { data: callerProfile } = await admin.from("profiles").select("actif").eq("id", callerId).maybeSingle();
+    if (!callerProfile || callerProfile.actif === false) throw new HttpError(403, "Compte désactivé");
 
-    if (!callerProfile) {
-      return new Response(JSON.stringify({ error: "Profil introuvable" }), {
-        status: 403,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    const url = new URL(req.url);
 
-    const callerRole = callerProfile.role as string;
-    const isAdmin = callerRole === "admin";
-
+    // ------------------------------------------------------------------ GET
     if (req.method === "GET") {
-      if (!isAdmin) {
-        return new Response(JSON.stringify({ error: "Accès refusé — admin uniquement" }), {
-          status: 403,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      // Each admin only sees users who share at least one of their espaces.
-      const { data: callerEspaces } = await adminClient
+      const espaceId = await assertEspaceAdmin(admin, callerId, url.searchParams.get("espace_id"));
+      const { data: members, error } = await admin
         .from("user_espaces")
-        .select("espace_id")
-        .eq("user_id", userData.user.id);
-
-      const espaceIds = callerEspaces?.map((r: { espace_id: string }) => r.espace_id) ?? [];
-      if (espaceIds.length === 0) {
-        return new Response(JSON.stringify({ users: [] }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      const { data: sharedUserIds } = await adminClient
-        .from("user_espaces")
-        .select("user_id")
-        .in("espace_id", espaceIds);
-
-      const userIds = [...new Set(sharedUserIds?.map((r: { user_id: string }) => r.user_id) ?? [])];
-
-      const { data: profiles, error: pErr } = await adminClient
-        .from("profiles")
-        .select("id, nom, email, role, langue, actif, cree_le, user_espaces(espace_id, role_dans_espace, espaces(id, nom))")
-        .in("id", userIds)
+        .select("role_dans_espace, profiles(id, nom, email, langue, actif, cree_le)")
+        .eq("espace_id", espaceId);
+      if (error) throw error;
+      const users = (members ?? [])
+        .filter((m) => m.profiles)
+        .map((m) => {
+          const p = m.profiles as unknown as Record<string, unknown>;
+          return { ...p, role: m.role_dans_espace };
+        })
+        .sort((a, b) => String(b.cree_le).localeCompare(String(a.cree_le)));
+      const { data: invitations, error: invErr } = await admin
+        .from("invitations_espace")
+        .select("id, email, role_dans_espace, cree_le")
+        .eq("espace_id", espaceId)
         .order("cree_le", { ascending: false });
-
-      if (pErr) throw pErr;
-      return new Response(JSON.stringify({ users: profiles ?? [] }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      if (invErr) throw invErr;
+      return json({
+        users,
+        invitations: (invitations ?? []).map((i) => ({ id: i.id, email: i.email, role: i.role_dans_espace, cree_le: i.cree_le })),
       });
     }
 
+    const body = req.method === "DELETE" ? {} : await req.json().catch(() => ({}));
+
+    // ----------------------------------------------------------------- POST
     if (req.method === "POST") {
-      if (!isAdmin) {
-        return new Response(JSON.stringify({ error: "Accès refusé — admin uniquement" }), {
-          status: 403,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      const body = await req.json();
-      const { email, password, nom, role, langue, espace_ids } = body as {
-        email: string;
-        password: string;
-        nom: string;
-        role: "operateur" | "admin" | "superviseur";
-        langue: "fr" | "mg";
-        espace_ids?: string[];
-      };
+      const espaceId = await assertEspaceAdmin(admin, callerId, body.espace_id);
+      const email = String(body.email ?? "").trim().toLowerCase();
+      const role: Role = ROLES.includes(body.role) ? body.role : "operateur";
+      if (!EMAIL_RE.test(email) || email.length > 254) throw new HttpError(400, "Adresse e-mail invalide");
 
-      if (!email || !password || !nom) {
-        return new Response(JSON.stringify({ error: "Champs manquants" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      // Determine which espaces the caller is admin of
-      const { data: callerAdminEspaces } = await adminClient
-        .from("user_espaces")
-        .select("espace_id")
-        .eq("user_id", userData.user.id)
-        .eq("role_dans_espace", "admin");
-      const callerEspaceIds = callerAdminEspaces?.map((r: { espace_id: string }) => r.espace_id) ?? [];
-
-      // Filter requested espace_ids to only those the caller is admin of
-      const targetEspaces = (espace_ids ?? []).filter((id) => callerEspaceIds.includes(id));
-
-      if (targetEspaces.length === 0) {
-        return new Response(JSON.stringify({ error: "Sélectionnez au moins un espace" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      const { data: created, error: createErr } = await adminClient.auth.admin.createUser({
-        email,
-        password,
-        email_confirm: true,
-        user_metadata: { nom, role, langue },
-      });
-
-      if (createErr) throw createErr;
-      const newUserId = created.user?.id as string;
-
-      const { error: profileErr } = await adminClient.from("profiles").upsert({
-        id: newUserId,
-        nom,
-        email,
-        role: role || "operateur",
-        langue: langue || "fr",
-        actif: true,
-      });
-      if (profileErr) throw profileErr;
-
-      // Assign to the selected espaces only
-      for (const esId of targetEspaces) {
-        await adminClient.from("user_espaces").upsert({
-          user_id: newUserId,
-          espace_id: esId,
-          role_dans_espace: role || "operateur",
-        }, { onConflict: "user_id,espace_id" });
-      }
-
-      return new Response(JSON.stringify({ id: newUserId, email, nom }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    if (req.method === "PUT") {
-      if (!isAdmin) {
-        return new Response(JSON.stringify({ error: "Accès refusé — admin uniquement" }), {
-          status: 403,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      const body = await req.json();
-      const { user_id, role, actif, langue, nom, espace_ids, action: bodyAction } = body as {
-        user_id: string;
-        role?: "operateur" | "admin" | "superviseur";
-        actif?: boolean;
-        langue?: "fr" | "mg";
-        nom?: string;
-        espace_ids?: string[];
-        action?: string;
-      };
-
-      if (!user_id) {
-        return new Response(JSON.stringify({ error: "user_id manquant" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      // Handle espace assignment actions
-      if (bodyAction === "assign_espace" && espace_ids && espace_ids.length > 0) {
-        for (const esId of espace_ids) {
-          await adminClient.from("user_espaces").upsert({
-            user_id,
-            espace_id: esId,
-            role_dans_espace: role || "operateur",
-          }, { onConflict: "user_id,espace_id" });
-        }
-        return new Response(JSON.stringify({ ok: true }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      if (bodyAction === "remove_espace" && espace_ids && espace_ids.length > 0) {
-        for (const esId of espace_ids) {
-          await adminClient.from("user_espaces")
-            .delete().eq("user_id", user_id).eq("espace_id", esId);
-        }
+      // Compte déjà existant → ajouté tout de suite à l'espace.
+      const { data: existing } = await admin.from("profiles").select("id, nom").eq("email", email).maybeSingle();
+      if (existing?.id) {
+        const { data: already } = await admin
+          .from("user_espaces")
+          .select("role_dans_espace")
+          .eq("user_id", existing.id)
+          .eq("espace_id", espaceId)
+          .maybeSingle();
+        if (already) throw new HttpError(409, "Cette personne est déjà membre de l'espace");
+        const { error: ueErr } = await admin
+          .from("user_espaces")
+          .insert({ user_id: existing.id, espace_id: espaceId, role_dans_espace: role });
         if (ueErr) throw ueErr;
-        return new Response(JSON.stringify({ ok: true }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        return json({ status: "added", email, nom: existing.nom });
       }
 
-      const updates: Record<string, unknown> = {};
-      if (role !== undefined) updates.role = role;
-      if (actif !== undefined) updates.actif = actif;
-      if (langue !== undefined) updates.langue = langue;
-      if (nom !== undefined) updates.nom = nom;
+      // Sinon → invitation en attente (une seule par adresse et par espace).
+      const { count } = await admin
+        .from("invitations_espace")
+        .select("id", { count: "exact", head: true })
+        .eq("espace_id", espaceId);
+      if ((count ?? 0) >= 200) throw new HttpError(400, "Trop d'invitations en attente pour cet espace");
+      const { error: invErr } = await admin
+        .from("invitations_espace")
+        .upsert({ espace_id: espaceId, email, role_dans_espace: role, invite_par: callerId }, { onConflict: "espace_id,email" });
+      if (invErr) throw invErr;
+      return json({ status: "invited", email });
+    }
 
-      const { error: updErr } = await adminClient
-        .from("profiles")
-        .update(updates)
-        .eq("id", user_id);
-      if (updErr) throw updErr;
+    // ------------------------------------------------------------------ PUT
+    if (req.method === "PUT") {
+      const espaceId = await assertEspaceAdmin(admin, callerId, body.espace_id);
+      const userId = body.user_id;
+      if (!isUuid(userId)) throw new HttpError(400, "user_id invalide");
 
-      if (actif === false) {
-        await adminClient.auth.admin.updateUserById(user_id, { ban_duration: "876000h" });
-      } else if (actif === true) {
-        await adminClient.auth.admin.updateUserById(user_id, { ban_duration: "none" });
+      const { data: membership } = await admin
+        .from("user_espaces")
+        .select("role_dans_espace")
+        .eq("user_id", userId)
+        .eq("espace_id", espaceId)
+        .maybeSingle();
+      if (!membership) throw new HttpError(404, "Ce membre n'appartient pas à l'espace");
+
+      if (body.role !== undefined) {
+        if (!ROLES.includes(body.role)) throw new HttpError(400, "Rôle invalide");
+        if (userId === callerId && body.role !== "admin") {
+          throw new HttpError(400, "Vous ne pouvez pas retirer vos propres droits d'administrateur");
+        }
+        if (membership.role_dans_espace === "admin" && body.role !== "admin" && (await countAdmins(admin, espaceId)) <= 1) {
+          throw new HttpError(400, "L'espace doit garder au moins un administrateur");
+        }
+        const { error } = await admin
+          .from("user_espaces")
+          .update({ role_dans_espace: body.role })
+          .eq("user_id", userId)
+          .eq("espace_id", espaceId);
+        if (error) throw error;
       }
 
-      // Sync espace assignments if provided
-      if (espace_ids !== undefined) {
-        const { data: callerAdminEspaces } = await adminClient
+      const profileUpdates: Record<string, unknown> = {};
+      if (typeof body.nom === "string" && body.nom.trim()) profileUpdates.nom = body.nom.trim().slice(0, 100);
+      if (body.langue === "fr" || body.langue === "mg") profileUpdates.langue = body.langue;
+
+      if (typeof body.actif === "boolean") {
+        if (userId === callerId) throw new HttpError(400, "Vous ne pouvez pas désactiver votre propre compte");
+        // La désactivation agit sur TOUS les espaces du membre : on ne l'autorise
+        // que si l'appelant administre chacun de ces espaces.
+        const { data: targetSpaces } = await admin.from("user_espaces").select("espace_id").eq("user_id", userId);
+        const { data: callerAdminSpaces } = await admin
           .from("user_espaces")
           .select("espace_id")
-          .eq("user_id", userData.user.id)
+          .eq("user_id", callerId)
           .eq("role_dans_espace", "admin");
-        const callerEspaceIds = callerAdminEspaces?.map((r: { espace_id: string }) => r.espace_id) ?? [];
-        const validEspaceIds = espace_ids.filter((id) => callerEspaceIds.includes(id));
-
-        // Remove from espaces the caller controls but are no longer selected
-        const { data: existingUE } = await adminClient
-          .from("user_espaces")
-          .select("espace_id")
-          .eq("user_id", user_id)
-          .in("espace_id", callerEspaceIds);
-        const existingIds = existingUE?.map((r: { espace_id: string }) => r.espace_id) ?? [];
-        const toRemove = existingIds.filter((id) => !validEspaceIds.includes(id));
-        for (const esId of toRemove) {
-          await adminClient.from("user_espaces").delete().eq("user_id", user_id).eq("espace_id", esId);
+        const adminSet = new Set((callerAdminSpaces ?? []).map((r) => r.espace_id));
+        const controlsAll = (targetSpaces ?? []).every((r) => adminSet.has(r.espace_id));
+        if (!controlsAll) {
+          throw new HttpError(403, "Ce compte appartient aussi à d'autres espaces : retirez-le de votre espace à la place");
         }
-        // Add new ones
-        for (const esId of validEspaceIds) {
-          await adminClient.from("user_espaces").upsert({
-            user_id,
-            espace_id: esId,
-            role_dans_espace: role || "operateur",
-          }, { onConflict: "user_id,espace_id" });
-        }
+        profileUpdates.actif = body.actif;
+        const { error: banErr } = await admin.auth.admin.updateUserById(userId, {
+          ban_duration: body.actif ? "none" : "876000h",
+        });
+        if (banErr) throw banErr;
       }
 
-      return new Response(JSON.stringify({ ok: true }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      if (Object.keys(profileUpdates).length > 0) {
+        const { error } = await admin.from("profiles").update(profileUpdates).eq("id", userId);
+        if (error) throw error;
+      }
+      return json({ ok: true });
     }
 
+    // --------------------------------------------------------------- DELETE
     if (req.method === "DELETE") {
-      if (!isAdmin) {
-        return new Response(JSON.stringify({ error: "Accès refusé — admin uniquement" }), {
-          status: 403,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      const url = new URL(req.url);
-      const user_id = url.searchParams.get("user_id");
-      if (!user_id) {
-        return new Response(JSON.stringify({ error: "user_id manquant" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      if (user_id === userData.user.id) {
-        return new Response(JSON.stringify({ error: "Impossible de supprimer votre propre compte" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+      const espaceId = await assertEspaceAdmin(admin, callerId, url.searchParams.get("espace_id"));
+
+      const invitationId = url.searchParams.get("invitation_id");
+      if (invitationId !== null) {
+        if (!isUuid(invitationId)) throw new HttpError(400, "invitation_id invalide");
+        const { error } = await admin.from("invitations_espace").delete().eq("id", invitationId).eq("espace_id", espaceId);
+        if (error) throw error;
+        return json({ ok: true });
       }
 
-      // Delete user_espaces entries, profile, and auth user
-      await adminClient.from("user_espaces").delete().eq("user_id", user_id);
-      await adminClient.from("transactions").delete().eq("auteur_id", user_id);
-      await adminClient.from("transactions_recurrentes").delete().eq("auteur_id", user_id);
-      await adminClient.from("transactions_planifiees").delete().eq("auteur_id", user_id);
-      await adminClient.from("profiles").delete().eq("id", user_id);
-      const { error: delErr } = await adminClient.auth.admin.deleteUser(user_id);
-      if (delErr) throw delErr;
+      const userId = url.searchParams.get("user_id");
+      if (!isUuid(userId)) throw new HttpError(400, "user_id invalide");
+      if (userId === callerId) throw new HttpError(400, "Vous ne pouvez pas vous retirer vous-même");
 
-      return new Response(JSON.stringify({ ok: true }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      const { data: membership } = await admin
+        .from("user_espaces")
+        .select("role_dans_espace")
+        .eq("user_id", userId)
+        .eq("espace_id", espaceId)
+        .maybeSingle();
+      if (!membership) throw new HttpError(404, "Ce membre n'appartient pas à l'espace");
+      if (membership.role_dans_espace === "admin" && (await countAdmins(admin, espaceId)) <= 1) {
+        throw new HttpError(400, "L'espace doit garder au moins un administrateur");
+      }
+
+      // On retire seulement l'accès : les transactions saisies restent dans
+      // l'espace (traçabilité comptable).
+      const { error } = await admin.from("user_espaces").delete().eq("user_id", userId).eq("espace_id", espaceId);
+      if (error) throw error;
+      return json({ ok: true });
     }
 
-    return new Response(JSON.stringify({ error: "Méthode non supportée" }), {
-      status: 405,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    throw new HttpError(405, "Méthode non supportée");
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Erreur serveur";
-    return new Response(JSON.stringify({ error: message }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    if (err instanceof HttpError) return json({ error: err.message }, err.status);
+    console.error("[admin-users]", err);
+    return json({ error: "Erreur serveur" }, 500);
   }
 });

@@ -3,13 +3,13 @@ import { ArrowDownCircle, ArrowUpCircle, Calendar, FileText, Coins, Tag, CheckCi
 import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { useTransactions } from "@/lib/useTransactions";
-import { t, type Lang, categoryLabel } from "@/lib/i18n";
+import { t, categoryLabel } from "@/lib/i18n";
 import { todayISO } from "@/lib/format";
 import { genClientUuid } from "@/lib/db";
 
 export function SaisiePage() {
   const { profile, lang } = useAuth();
-  const { categories, validationThreshold, createTransaction, deleteTransaction, transactions } = useTransactions();
+  const { categories, validationThreshold, createTransaction, deleteTransaction } = useTransactions();
   const [date, setDate] = useState(todayISO());
   const [motif, setMotif] = useState("");
   const [type, setType] = useState<"miditra" | "mivoaka">("miditra");
@@ -154,7 +154,7 @@ export function SaisiePage() {
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2">
               <div>
                 <label className="input-label">{t(lang, "date")}</label>
                 <div className="relative">
@@ -166,7 +166,7 @@ export function SaisiePage() {
                 <label className="input-label">{t(lang, "amount")} (Ar)</label>
                 <div className="relative">
                   <Coins size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-                  <input type="number" step="0.01" min="0" value={montant} onChange={(e) => setMontant(e.target.value)} placeholder="0" className="input pl-10" />
+                  <input type="number" inputMode="decimal" step="any" min="0" value={montant} onChange={(e) => setMontant(e.target.value)} placeholder="0" className="input pl-10" />
                 </div>
               </div>
             </div>

@@ -12,7 +12,6 @@ import {
   Clock,
   Inbox,
   Check,
-  X,
   Tag,
 } from "lucide-react";
 import { t, type Lang, categoryLabel } from "@/lib/i18n";
@@ -43,6 +42,8 @@ interface Props {
   lang: Lang;
   rows: TransactionRow[];
   role: UserRole;
+  /** Utilisateur courant : seuls l'admin et l'auteur peuvent modifier une ligne. */
+  currentUserId?: string;
   showAuthor?: boolean;
   categories: Category[];
   validationThreshold: number;
@@ -58,6 +59,7 @@ export function TransactionTable({
   lang,
   rows,
   role,
+  currentUserId,
   showAuthor = false,
   categories,
   validationThreshold,
@@ -76,6 +78,7 @@ export function TransactionTable({
   const [editing, setEditing] = useState<TransactionRow | null>(null);
 
   const isAdmin = role === "admin";
+  const canModify = (row: TransactionRow) => isAdmin || !row.auteur_id || row.auteur_id === currentUserId;
   const showTotals = role === "admin" || role === "superviseur";
 
   const filtered = useMemo(() => {
@@ -307,12 +310,18 @@ export function TransactionTable({
                             <Check size={15} />
                           </button>
                         )}
-                        <button onClick={() => openEdit(row)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-emerald-400" title={t(lang, "edit")}>
-                          <Pencil size={15} />
-                        </button>
-                        <button onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400" title={t(lang, "delete")}>
-                          <Trash2 size={15} />
-                        </button>
+                        {canModify(row) ? (
+                          <>
+                            <button onClick={() => openEdit(row)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-emerald-400" title={t(lang, "edit")} aria-label={t(lang, "edit")}>
+                              <Pencil size={15} />
+                            </button>
+                            <button onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400" title={t(lang, "delete")} aria-label={t(lang, "delete")}>
+                              <Trash2 size={15} />
+                            </button>
+                          </>
+                        ) : (
+                          <span className="px-1.5 text-[10px] text-slate-600" title={t(lang, "readOnly")}>{t(lang, "readOnly")}</span>
+                        )}
                       </div>
                     </td>
                   </tr>

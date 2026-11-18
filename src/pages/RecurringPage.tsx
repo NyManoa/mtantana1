@@ -3,11 +3,12 @@ import { Repeat, Plus, X, Trash2, Calendar, Clock, Bell, CheckCircle2, CalendarC
 import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { useEspace } from "@/lib/espace";
-import { useTransactions } from "@/lib/useTransactions";
+import { useTransactions, generateDueRecurring } from "@/lib/useTransactions";
+import { useDataVersion } from "@/lib/sync";
 import { useToast } from "@/components/Toast";
-import { db, genId } from "@/lib/db";
+import { db, dirtyFlag, genId, notifyDataChanged, updateDirty } from "@/lib/db";
 import { t, categoryLabel } from "@/lib/i18n";
-import { formatAriary, formatDate, todayISO } from "@/lib/format";
+import { formatAriary, formatDate, todayISO, daysUntil } from "@/lib/format";
 
 interface Recurring {
   id: number;
@@ -20,6 +21,7 @@ interface Recurring {
   montant: number;
   actif: boolean;
   cree_le: string;
+  auteur_id: string;
 }
 
 interface Scheduled {
@@ -33,12 +35,14 @@ interface Scheduled {
   alerte_jours_avant: number;
   statut: "en_attente" | "realisee" | "annulee";
   cree_le: string;
+  auteur_id: string;
 }
 
 export function RecurringPage() {
   const { profile, lang } = useAuth();
-  const { currentEspace } = useEspace();
+  const { currentEspace, role } = useEspace();
   const { categories, createTransaction } = useTransactions();
+  const version = useDataVersion();
   const { show: showToast } = useToast();
   const [recurring, setRecurring] = useState<Recurring[]>([]);
   const [scheduled, setScheduled] = useState<Scheduled[]>([]);
@@ -66,26 +70,25 @@ export function RecurringPage() {
   const loadRecurring = useCallback(async () => {
     if (!currentEspace) return;
     const rows = await db.recurring.where("espace_id").equals(currentEspace.id).toArray();
-    const active = rows.filter(r => r.actif).sort((a, b) => a.prochaine_occurrence.localeCompare(b.prochaine_occurrence));
-    setRecurring(active as Recurring[]);
-  }, [currentEspace]);
+    const active = rows.filter(r => r.actif && !r.deleted && (role !== "operateur" || r.auteur_id === profile?.id)).sort((a, b) => a.prochaine_occurrence.localeCompare(b.prochaine_occurrence));
+    setRecurring(active.map((r) => ({ ...r, id: r.id! })));
+  }, [currentEspace, role, profile?.id]);
 
   const loadScheduled = useCallback(async () => {
     if (!currentEspace) return;
     const rows = await db.scheduled.where("espace_id").equals(currentEspace.id).toArray();
-    const pending = rows.filter(r => r.statut === "en_attente").sort((a, b) => a.date_prevue.localeCompare(b.date_prevue));
-    setScheduled(pending as Scheduled[]);
-  }, [currentEspace]);
+    const pending = rows.filter(r => r.statut === "en_attente" && !r.deleted && (role !== "operateur" || r.auteur_id === profile?.id)).sort((a, b) => a.date_prevue.localeCompare(b.date_prevue));
+    setScheduled(pending.map((s) => ({ ...s, id: s.id! })));
+  }, [currentEspace, role, profile?.id]);
 
   useEffect(() => {
     Promise.all([loadRecurring(), loadScheduled()]).finally(() => setLoading(false));
-  }, [loadRecurring, loadScheduled]);
+  }, [loadRecurring, loadScheduled, version]);
 
   useEffect(() => {
     if (scheduled.length === 0) return;
-    const today = todayISO();
     for (const s of scheduled) {
-      const daysDiff = Math.floor((new Date(s.date_prevue).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
+      const daysDiff = daysUntil(s.date_prevue);
       if (daysDiff <= s.alerte_jours_avant && daysDiff >= 0) {
         const key = `sched_alert_${s.id}`;
         if (!localStorage.getItem(key)) {
@@ -96,34 +99,29 @@ export function RecurringPage() {
     }
   }, [scheduled, lang, showToast]);
 
-  const computeNext = (date: string, freq: Recurring["frequence"]): string => {
-    const d = new Date(date);
-    switch (freq) {
-      case "quotidien": d.setDate(d.getDate() + 1); break;
-      case "hebdomadaire": d.setDate(d.getDate() + 7); break;
-      case "mensuel": d.setMonth(d.getMonth() + 1); break;
-      case "annuel": d.setFullYear(d.getFullYear() + 1); break;
-    }
-    return d.toISOString().slice(0, 10);
-  };
-
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!profile || !rMotif.trim() || !rMontant || !currentEspace) return;
+    const montant = parseFloat(rMontant);
+    if (!profile || !rMotif.trim() || !Number.isFinite(montant) || montant <= 0 || !currentEspace) return;
     setSubmitting(true);
     await db.recurring.add({
+      uuid: genId(),
       date_depart: rDate,
       frequence: rFreq,
-      prochaine_occurrence: computeNext(rDate, rFreq),
+      // La première occurrence est la date de départ elle-même.
+      prochaine_occurrence: rDate,
       motif: rMotif.trim(),
       categorie: rCat,
       type_operation: rType,
-      montant: parseFloat(rMontant),
+      montant,
       auteur_id: profile.id,
       actif: true,
       espace_id: currentEspace.id,
       cree_le: new Date().toISOString(),
+      dirty: dirtyFlag(),
     });
+    notifyDataChanged();
+    await generateDueRecurring(currentEspace.id, profile.id);
     setModalOpen(false);
     setRMotif("");
     setRMontant("");
@@ -132,27 +130,31 @@ export function RecurringPage() {
   };
 
   const handleDelete = async (id: number) => {
-    await db.recurring.update(id, { actif: false });
-    loadRecurring();
+    if (!window.confirm(t(lang, "confirmDelete"))) return;
+    await updateDirty("recurring", id, { actif: false });
   };
 
   const handleSchedSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!profile || !sTitre.trim() || !sMontant || !currentEspace) return;
+    const sAmount = parseFloat(sMontant);
+    if (!profile || !sTitre.trim() || !Number.isFinite(sAmount) || sAmount < 0 || !currentEspace) return;
     setSchedSubmitting(true);
     await db.scheduled.add({
+      uuid: genId(),
       titre: sTitre.trim(),
       motif: sMotif.trim(),
       categorie: sCat,
       type_operation: sType,
-      montant: parseFloat(sMontant),
+      montant: sAmount,
       date_prevue: sDate,
       alerte_jours_avant: parseInt(sAlertDays) || 1,
       auteur_id: profile.id,
       statut: "en_attente",
       espace_id: currentEspace.id,
       cree_le: new Date().toISOString(),
+      dirty: dirtyFlag(),
     });
+    notifyDataChanged();
     setSchedModalOpen(false);
     setSTitre("");
     setSMotif("");
@@ -172,20 +174,17 @@ export function RecurringPage() {
         categorie: s.categorie,
       });
     }
-    await db.scheduled.update(s.id, { statut: "realisee" });
+    await updateDirty("scheduled", s.id, { statut: "realisee" });
     localStorage.removeItem(`sched_alert_${s.id}`);
-    loadScheduled();
   };
 
   const handleSchedCancel = async (id: number) => {
-    await db.scheduled.update(id, { statut: "annulee" });
+    await updateDirty("scheduled", id, { statut: "annulee" });
     localStorage.removeItem(`sched_alert_${id}`);
-    loadScheduled();
   };
 
-  const today = todayISO();
   const upcomingAlerts = scheduled.filter((s) => {
-    const daysDiff = Math.floor((new Date(s.date_prevue).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
+    const daysDiff = daysUntil(s.date_prevue);
     return daysDiff <= s.alerte_jours_avant && daysDiff >= 0;
   });
 
@@ -209,7 +208,7 @@ export function RecurringPage() {
       {upcomingAlerts.length > 0 && (
         <div className="mb-6 space-y-2">
           {upcomingAlerts.map((s) => {
-            const daysDiff = Math.floor((new Date(s.date_prevue).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
+            const daysDiff = daysUntil(s.date_prevue);
             return (
               <div key={s.id} className="card animate-fade-up flex items-center gap-3 border-amber-500/30 bg-amber-500/5 p-4">
                 <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-amber-400">
@@ -248,7 +247,7 @@ export function RecurringPage() {
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {scheduled.map((s) => {
-              const daysDiff = Math.floor((new Date(s.date_prevue).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
+              const daysDiff = daysUntil(s.date_prevue);
               const isAlert = daysDiff <= s.alerte_jours_avant && daysDiff >= 0;
               return (
                 <div key={s.id} className={`card card-hover p-4 ${isAlert ? "border-amber-500/30" : ""}`}>
@@ -271,14 +270,14 @@ export function RecurringPage() {
                     <Clock size={11} />
                     {t(lang, "alertDays")}: {s.alerte_jours_avant}
                   </div>
-                  <div className="mt-3 flex gap-1.5">
+                  {(role === "admin" || s.auteur_id === profile?.id) && <div className="mt-3 flex gap-1.5">
                     <button onClick={() => handleSchedDone(s)} className="btn-primary !py-1.5 !px-2.5 !text-xs flex-1">
                       <CheckCircle2 size={13} />{t(lang, "markAsDone")}
                     </button>
-                    <button onClick={() => handleSchedCancel(s.id)} className="btn-ghost !py-1.5 !px-2 !text-xs">
+                    <button onClick={() => handleSchedCancel(s.id)} className="btn-ghost !py-1.5 !px-2 !text-xs" aria-label={t(lang, "cancel")}>
                       <X size={13} />
                     </button>
-                  </div>
+                  </div>}
                 </div>
               );
             })}
@@ -306,9 +305,11 @@ export function RecurringPage() {
                   <div className={`flex h-8 w-8 items-center justify-center rounded-lg ${r.type_operation === "miditra" ? "bg-emerald-500/15 text-emerald-400" : "bg-rose-500/15 text-rose-400"}`}>
                     <Repeat size={15} />
                   </div>
-                  <button onClick={() => handleDelete(r.id)} className="rounded-lg p-1 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400">
-                    <Trash2 size={13} />
-                  </button>
+                  {(role === "admin" || r.auteur_id === profile?.id) && (
+                    <button onClick={() => handleDelete(r.id)} className="rounded-lg p-1 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400" aria-label={t(lang, "delete")}>
+                      <Trash2 size={13} />
+                    </button>
+                  )}
                 </div>
                 <div className="text-sm font-bold text-white">{r.motif}</div>
                 <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">

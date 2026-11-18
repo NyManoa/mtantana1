@@ -1,7 +1,10 @@
-import { type ReactNode, useState } from "react";
-import { Menu, X } from "lucide-react";
+import { type ReactNode, useEffect, useState } from "react";
+import { Menu, X, WifiOff } from "lucide-react";
 import { Sidebar } from "./Sidebar";
 import { Footer } from "./Footer";
+import { useAuth } from "@/lib/auth";
+import { useSync } from "@/lib/sync";
+import { t } from "@/lib/i18n";
 
 interface LayoutProps {
   children: ReactNode;
@@ -13,20 +16,39 @@ interface LayoutProps {
 
 export function Layout({ children, title, subtitle, actions, noFooter }: LayoutProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const { lang, mode, cloudStatus } = useAuth();
+  const { state } = useSync();
+  const cloudDown = mode === "cloud" && (!state.online || cloudStatus === "unreachable");
+  const downLabel = !state.online ? t(lang, "offline") : t(lang, "serverDown");
+
+  useEffect(() => {
+    document.title = `${title} · M'tantana`;
+  }, [title]);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMobileOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mobileOpen]);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#0b1220]">
+    <div className="flex h-[100dvh] overflow-hidden bg-[#0b1220]">
+      <a href="#main" className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50 focus:rounded-lg focus:bg-emerald-500 focus:px-3 focus:py-2 focus:text-sm focus:font-semibold focus:text-emerald-950">
+        {t(lang, "skipToContent")}
+      </a>
+
       <div className="hidden md:block">
         <Sidebar />
       </div>
 
       {mobileOpen && (
-        <div className="fixed inset-0 z-40 md:hidden">
+        <div className="fixed inset-0 z-40 md:hidden" role="dialog" aria-modal="true" aria-label={t(lang, "menu")}>
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setMobileOpen(false)} />
           <div className="absolute left-0 top-0 h-full animate-fade-up">
             <div className="relative h-full">
-              <Sidebar />
-              <button onClick={() => setMobileOpen(false)} className="absolute -right-10 top-3 rounded-lg bg-white/10 p-2 text-slate-300">
+              <Sidebar onNavigate={() => setMobileOpen(false)} />
+              <button onClick={() => setMobileOpen(false)} className="absolute -right-11 top-3 rounded-lg bg-white/10 p-2 text-slate-300" aria-label={t(lang, "close")}>
                 <X size={18} />
               </button>
             </div>
@@ -35,23 +57,35 @@ export function Layout({ children, title, subtitle, actions, noFooter }: LayoutP
       )}
 
       <div className="flex flex-1 flex-col overflow-hidden">
-        <header className="flex items-center justify-between border-b border-white/10 px-4 py-4 sm:px-6">
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setMobileOpen(true)}
-              className="rounded-lg p-2 text-slate-400 transition hover:bg-white/10 hover:text-white md:hidden"
-            >
+        <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-4 sm:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <button onClick={() => setMobileOpen(true)} className="rounded-lg p-2 text-slate-400 transition hover:bg-white/10 hover:text-white md:hidden" aria-label={t(lang, "menu")}>
               <Menu size={20} />
             </button>
-            <div>
-              <h1 className="text-lg font-bold text-white sm:text-xl">{title}</h1>
-              {subtitle && <p className="mt-0.5 text-sm text-slate-400">{subtitle}</p>}
+            <div className="min-w-0">
+              <h1 className="truncate text-lg font-bold text-white sm:text-xl">{title}</h1>
+              {subtitle && <p className="mt-0.5 truncate text-sm text-slate-400">{subtitle}</p>}
             </div>
           </div>
-          {actions && <div className="flex items-center gap-2">{actions}</div>}
+          <div className="flex items-center gap-2">
+            {cloudDown && (
+              <span className="hidden items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300 sm:inline-flex">
+                <WifiOff size={12} />
+                {downLabel}
+              </span>
+            )}
+            {actions}
+          </div>
         </header>
+        {cloudDown && (
+          <div className="flex items-center gap-2 border-b border-amber-500/20 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-300 sm:hidden">
+            <WifiOff size={12} />
+            {downLabel}
+            {state.pending > 0 && ` · ${t(lang, "pendingCount", { n: state.pending })}`}
+          </div>
+        )}
         <div className="flex flex-1 flex-col overflow-y-auto">
-          <main className="flex-1 px-4 py-6 sm:px-6">{children}</main>
+          <main id="main" className="flex-1 px-4 py-6 sm:px-6">{children}</main>
           {!noFooter && <Footer />}
         </div>
       </div>

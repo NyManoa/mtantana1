@@ -4,9 +4,10 @@ import { useAuth } from "@/lib/auth";
 import { useEspace } from "@/lib/espace";
 import { t } from "@/lib/i18n";
 import { useToast } from "@/components/Toast";
+import { pingCloud } from "@/lib/supabase";
 
 export function EspaceGuard({ children }: { children: ReactNode }) {
-  const { profile, lang, loading: authLoading } = useAuth();
+  const { profile, lang, loading: authLoading, mode, cloudStatus, signOut } = useAuth();
   const { espaces, loading, createEspace, refresh } = useEspace();
   const { show: showToast } = useToast();
   const [newName, setNewName] = useState("");
@@ -48,6 +49,16 @@ export function EspaceGuard({ children }: { children: ReactNode }) {
           </div>
           <h2 className="text-lg font-bold text-white">{t(lang, "noEspaceTitle")}</h2>
           <p className="mt-2 text-sm text-slate-400">{t(lang, "noEspaceMsg")}</p>
+          {mode === "cloud" && (cloudStatus !== "ok" || !navigator.onLine) && (
+            <div role="status" className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-left text-xs text-amber-200">
+              <div className="font-semibold">{t(lang, "cloudUnreachableTitle")}</div>
+              <div className="mt-1 text-amber-200/80">{t(lang, "noEspaceServerDown")}</div>
+              <div className="mt-2 flex gap-3">
+                <button type="button" onClick={async () => { await pingCloud(); await refresh(); }} className="font-semibold underline underline-offset-2">{t(lang, "retry")}</button>
+                <button type="button" onClick={() => signOut()} className="font-semibold underline underline-offset-2">{t(lang, "useWithoutAccount")}</button>
+              </div>
+            </div>
+          )}
 
           <div className="mt-6 space-y-3">
             <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2.5">

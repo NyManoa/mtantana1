@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   LayoutDashboard,
   TrendingUp,
@@ -8,24 +8,33 @@ import {
   ArrowUpCircle,
   Trophy,
   Users as UsersIcon,
-  ArrowRight,
+  AlertTriangle,
 } from "lucide-react";
 import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { useEspace } from "@/lib/espace";
 import { useTransactions } from "@/lib/useTransactions";
+import { useDataVersion } from "@/lib/sync";
+import { db, type LocalAlerte } from "@/lib/db";
 import { t, categoryLabel } from "@/lib/i18n";
-import { formatAriary, formatDate, currentMonthYear, previousMonthYear, monthLabel } from "@/lib/format";
+import { formatAriary, formatDate, currentMonthYear, previousMonthYear, monthLabel, lastMonths } from "@/lib/format";
 import { MonthlyBarChart, type MonthlyPoint } from "@/components/charts/MonthlyBarChart";
 import { CategoryPieChart, type PieSlice } from "@/components/charts/CategoryPieChart";
 
 
 export function DashboardPage() {
   const { profile, lang } = useAuth();
-  const { currentEspace } = useEspace();
+  const { role, currentEspace } = useEspace();
   const { transactions, categories } = useTransactions();
+  const version = useDataVersion();
+  const [alertes, setAlertes] = useState<LocalAlerte[]>([]);
 
-  const isAdmin = profile?.role === "admin";
+  useEffect(() => {
+    if (!currentEspace) return;
+    db.alertes.where("espace_id").equals(currentEspace.id).toArray().then((rows) => setAlertes(rows.filter((a) => a.active && !a.deleted)));
+  }, [currentEspace, version]);
+
+  const isAdmin = role === "admin";
   const thisMonth = currentMonthYear();
   const lastMonth = previousMonthYear(thisMonth);
 
@@ -37,13 +46,7 @@ export function DashboardPage() {
   }, [transactions]);
 
   const monthlyData: MonthlyPoint[] = useMemo(() => {
-    const months: string[] = [];
-    const now = new Date();
-    for (let i = 5; i >= 0; i--) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      months.push(d.toISOString().slice(0, 7));
-    }
-    return months.map((m) => {
+    return lastMonths(6).map((m) => {
       const monthRows = transactions.filter(
         (r) => r.statut === "validee" && r.date_transaction.startsWith(m)
       );
@@ -101,11 +104,40 @@ export function DashboardPage() {
 
   const recent = transactions.slice(0, 6);
 
+  // Alertes configurées dans la page « Alertes » : évaluées ici en temps réel.
+  const triggered = useMemo(() => {
+    const out: string[] = [];
+    const monthAgo = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
+    for (const a of alertes) {
+      if (a.type === "solde_bas" && stats.balance < a.seuil) {
+        out.push(t(lang, "alertLowBalance", { solde: formatAriary(stats.balance, lang), seuil: formatAriary(a.seuil, lang) }));
+      }
+      if (a.type === "grosse_depense") {
+        transactions
+          .filter((r) => r.type_operation === "mivoaka" && r.montant >= a.seuil && r.date_transaction >= monthAgo)
+          .slice(0, 3)
+          .forEach((r) => out.push(t(lang, "alertBigExpense", { motif: r.motif, montant: formatAriary(r.montant, lang) })));
+      }
+    }
+    return out;
+  }, [alertes, stats.balance, transactions, lang]);
+
   return (
     <Layout
       title={`${t(lang, "welcomeBack")}, ${profile?.nom ?? ""}`}
       subtitle={isAdmin ? t(lang, "adminView") : t(lang, "superviseurView")}
     >
+      {triggered.length > 0 && (
+        <div role="alert" className="mb-5 space-y-1.5 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
+          {triggered.map((m, i) => (
+            <div key={i} className="flex items-center gap-2 text-sm text-amber-200">
+              <AlertTriangle size={15} className="shrink-0 text-amber-400" />
+              {m}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Stat cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div className="card card-hover relative overflow-hidden p-5">

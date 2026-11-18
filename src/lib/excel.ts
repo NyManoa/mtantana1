@@ -1,4 +1,5 @@
-import * as XLSX from "xlsx";
+// xlsx est chargé à la demande (≈ 400 Ko) pour alléger le premier chargement.
+const loadXlsx = () => import("xlsx");
 import type { Lang } from "./i18n";
 import { t } from "./i18n";
 
@@ -17,7 +18,8 @@ export interface ExportRow {
  * Date, Motif, Vola miditra, Vola mivoaka, Solde (running balance).
  * Plus Category and Author columns. Rows sorted ascending by date/creation.
  */
-export function exportTransactionsExcel(rows: ExportRow[], lang: Lang, filename: string) {
+export async function exportTransactionsExcel(rows: ExportRow[], lang: Lang, filename: string) {
+  const XLSX = await loadXlsx();
   const sorted = [...rows].sort((a, b) =>
     (a.date_transaction + a.cree_le).localeCompare(b.date_transaction + b.cree_le)
   );
@@ -74,15 +76,15 @@ function parseDate(raw: unknown): string | null {
   if (typeof raw === "number" && raw > 0 && raw < 100000) {
     const epoch = new Date(Date.UTC(1899, 11, 30));
     const dt = new Date(epoch.getTime() + raw * 86400000);
-    if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10);
+    if (!isNaN(dt.getTime())) return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
   }
   const s = String(raw).trim();
   if (!s) return null;
   // ISO: AAAA-MM-JJ or AAAA/MM/JJ
-  let m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  let m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
   if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
   // DD/MM/YYYY or DD-MM-YYYY
-  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
   if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
   // DD.MM.YYYY
   m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
@@ -107,7 +109,7 @@ function parseDate(raw: unknown): string | null {
     jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
     jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
     janv: "01", fevr: "02", mars: "03", avr: "04", mai: "05", juin: "06",
-    juil: "07", aout: "08", sept: "09", oct: "10", nov: "11", déc: "12",
+    juil: "07", aout: "08", août: "08", sept: "09", déc: "12", dece: "12",
   };
   m = s.match(/^(\d{1,2})\s+([a-zéû]{3,4})\s+(\d{4})$/i);
   if (m) {
@@ -130,8 +132,9 @@ function parseAmount(raw: unknown): number | null {
 
 export function parseImportFile(file: File, callback: (rows: ImportRow[], fileName: string) => void) {
   const reader = new FileReader();
-  reader.onload = (e) => {
+  reader.onload = async (e) => {
     try {
+      const XLSX = await loadXlsx();
       const data = new Uint8Array(e.target?.result as ArrayBuffer);
       const wb = XLSX.read(data, { type: "array" });
       const ws = wb.Sheets[wb.SheetNames[0]];

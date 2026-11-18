@@ -3,7 +3,8 @@ import { Bell, Plus, X, Trash2 } from "lucide-react";
 import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { useEspace } from "@/lib/espace";
-import { db } from "@/lib/db";
+import { db, dirtyFlag, genId, notifyDataChanged, removeDirty, updateDirty } from "@/lib/db";
+import { useDataVersion } from "@/lib/sync";
 import { t } from "@/lib/i18n";
 import { formatAriary, formatDateTime } from "@/lib/format";
 
@@ -18,7 +19,9 @@ interface Alert {
 
 export function AlertsPage() {
   const { profile, lang } = useAuth();
-  const { currentEspace } = useEspace();
+  const { currentEspace, role } = useEspace();
+  const isAdmin = role === "admin";
+  const version = useDataVersion();
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
@@ -29,22 +32,19 @@ export function AlertsPage() {
   const loadAlerts = useCallback(async () => {
     if (!currentEspace) { setLoading(false); return; }
     const rows = await db.alertes.where("espace_id").equals(currentEspace.id).toArray();
-    setAlerts(rows.map(r => ({ ...r, derniere_notification: null })) as Alert[]);
+    setAlerts(rows.filter((r) => !r.deleted).map((r) => ({ id: r.id!, type: r.type, seuil: r.seuil, active: r.active, cree_le: r.cree_le ?? "", derniere_notification: null })));
     setLoading(false);
   }, [currentEspace]);
 
-  useEffect(() => { loadAlerts(); }, [loadAlerts]);
+  useEffect(() => { loadAlerts(); }, [loadAlerts, version]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!profile || !aSeuil || !currentEspace) return;
+    const seuil = parseFloat(aSeuil);
+    if (!profile || !currentEspace || !Number.isFinite(seuil) || seuil < 0) return;
     setSubmitting(true);
-    await db.alertes.add({
-      type: aType,
-      seuil: parseFloat(aSeuil),
-      active: true,
-      espace_id: currentEspace.id,
-    });
+    await db.alertes.add({ uuid: genId(), type: aType, seuil, active: true, espace_id: currentEspace.id, cree_le: new Date().toISOString(), dirty: dirtyFlag() });
+    notifyDataChanged();
     setModalOpen(false);
     setASeuil("");
     loadAlerts();
@@ -52,20 +52,19 @@ export function AlertsPage() {
   };
 
   const handleDelete = async (id: number) => {
-    await db.alertes.delete(id);
-    loadAlerts();
+    if (!window.confirm(t(lang, "confirmDelete"))) return;
+    await removeDirty("alertes", id);
   };
 
   const toggleActive = async (a: Alert) => {
-    await db.alertes.update(a.id, { active: !a.active });
-    loadAlerts();
+    await updateDirty("alertes", a.id, { active: !a.active });
   };
 
   return (
     <Layout
       title={t(lang, "alertsTitle")}
       subtitle={t(lang, "alertsHint")}
-      actions={<button onClick={() => setModalOpen(true)} className="btn-primary"><Plus size={16} />{t(lang, "addAlert")}</button>}
+      actions={isAdmin ? <button onClick={() => setModalOpen(true)} className="btn-primary"><Plus size={16} />{t(lang, "addAlert")}</button> : <span className="badge-operator">{t(lang, "readOnly")}</span>}
     >
       {loading ? (
         <div className="flex justify-center py-20 text-slate-500">{t(lang, "loading")}</div>
@@ -82,17 +81,19 @@ export function AlertsPage() {
                 <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/15 text-amber-400">
                   <Bell size={18} />
                 </div>
-                <div className="flex items-center gap-1">
+                {isAdmin ? <div className="flex items-center gap-1">
                   <button
                     onClick={() => toggleActive(a)}
                     className={`rounded-lg px-2 py-1 text-xs font-semibold transition ${a.active ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`}
                   >
                     {a.active ? t(lang, "active") : t(lang, "inactive")}
                   </button>
-                  <button onClick={() => handleDelete(a.id)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400">
+                  <button onClick={() => handleDelete(a.id)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400" aria-label={t(lang, "delete")}>
                     <Trash2 size={14} />
                   </button>
-                </div>
+                </div> : (
+                  <span className={`rounded-lg px-2 py-1 text-xs font-semibold ${a.active ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`}>{a.active ? t(lang, "active") : t(lang, "inactive")}</span>
+                )}
               </div>
               <div className="text-sm font-bold text-white">{t(lang, `alert_${a.type}`)}</div>
               <div className="mt-2 text-2xl font-extrabold text-amber-400">{formatAriary(a.seuil, lang)}</div>
@@ -125,7 +126,7 @@ export function AlertsPage() {
               </div>
               <div>
                 <label className="input-label">{t(lang, "alertThreshold")} (Ar)</label>
-                <input type="number" step="0.01" min="0" value={aSeuil} onChange={(e) => setASeuil(e.target.value)} className="input" placeholder="0" />
+                <input type="number" inputMode="decimal" step="any" min="0" required value={aSeuil} onChange={(e) => setASeuil(e.target.value)} className="input" placeholder="0" />
               </div>
               <button type="submit" disabled={submitting} className="btn-primary w-full">{submitting ? t(lang, "loading") : t(lang, "save")}</button>
             </form>

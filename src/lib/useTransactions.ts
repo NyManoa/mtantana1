@@ -1,8 +1,19 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { db, deduplicateLocalDb, genClientUuid, ensureSeedData, type LocalTransaction } from "./db";
-import { supabase } from "./supabase";
+import { useCallback, useEffect, useState } from "react";
+import {
+  db,
+  dirtyFlag,
+  genClientUuid,
+  isLocalMode,
+  notifyDataChanged,
+  nowISO,
+  todayISO,
+  uuidFromString,
+  type Frequence,
+  type LocalTransaction,
+} from "./db";
 import { useAuth } from "./auth";
 import { useEspace } from "./espace";
+import { useDataVersion } from "./sync";
 import type { TransactionFormData } from "@/components/TransactionForm";
 
 export interface DisplayTransaction {
@@ -33,254 +44,222 @@ export interface Category {
   user_id?: string | null;
 }
 
-interface ProfileMap {
-  [key: string]: string;
+export const DEFAULT_THRESHOLD = 100000;
+
+export function nextOccurrence(date: string, freq: Frequence): string {
+  const [y, m, d] = date.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  switch (freq) {
+    case "quotidien": dt.setDate(dt.getDate() + 1); break;
+    case "hebdomadaire": dt.setDate(dt.getDate() + 7); break;
+    case "mensuel": {
+      // 31 janvier → 28/29 février (et non 3 mars)
+      const target = new Date(dt.getFullYear(), dt.getMonth() + 1, 1);
+      const last = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+      dt.setFullYear(target.getFullYear(), target.getMonth(), Math.min(d, last));
+      break;
+    }
+    case "annuel": dt.setFullYear(dt.getFullYear() + 1); break;
+  }
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Crée les transactions des récurrences arrivées à échéance.
+ * L'identifiant de chaque occurrence est déterministe : deux appareils qui
+ * génèrent la même échéance produisent la même ligne (pas de doublon au cloud).
+ */
+export async function generateDueRecurring(espaceId: string, userId: string): Promise<number> {
+  const today = todayISO();
+  const due = (await db.recurring.where("espace_id").equals(espaceId).toArray()).filter(
+    (r) => r.actif && !r.deleted && r.auteur_id === userId && r.prochaine_occurrence <= today,
+  );
+  let created = 0;
+  for (const r of due) {
+    let next = r.prochaine_occurrence;
+    for (let guard = 0; next <= today && guard < 400; guard++) {
+      const client_uuid = await uuidFromString(`recurring:${r.uuid}:${next}`);
+      if (!(await db.transactions.where("client_uuid").equals(client_uuid).count())) {
+        await db.transactions.add({
+          client_uuid,
+          date_transaction: next,
+          motif: r.motif,
+          type_operation: r.type_operation,
+          montant: r.montant,
+          categorie: r.categorie,
+          statut: "validee",
+          auteur_id: userId,
+          cree_le: nowISO(),
+          modifie_le: null,
+          supprime: false,
+          espace_id: espaceId,
+          dirty: dirtyFlag(),
+        });
+        created++;
+      }
+      next = nextOccurrence(next, r.frequence);
+    }
+    await db.recurring.update(r.id!, { prochaine_occurrence: next, dirty: dirtyFlag() });
+  }
+  if (created) notifyDataChanged();
+  return created;
+}
+
+async function addLocalAudit(action: string, recordId: string, oldValue: unknown, newValue: unknown, authorId: string, espaceId: string) {
+  // En mode cloud, c'est le trigger SQL qui journalise (non falsifiable).
+  if (!isLocalMode()) return;
+  await db.journal_audit.add({
+    action,
+    table_concernee: "transactions",
+    enregistrement_id: recordId,
+    ancienne_valeur: oldValue == null ? null : JSON.stringify(oldValue),
+    nouvelle_valeur: newValue == null ? null : JSON.stringify(newValue),
+    auteur_id: authorId,
+    date_action: nowISO(),
+    espace_id: espaceId,
+  });
 }
 
 export function useTransactions() {
   const { profile } = useAuth();
-  const { currentEspace } = useEspace();
+  const { currentEspace, role } = useEspace();
+  const version = useDataVersion();
   const [transactions, setTransactions] = useState<DisplayTransaction[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
-  const profileMapRef = useRef<ProfileMap>({});
-  const [validationThreshold, setValidationThreshold] = useState(100000);
+  const [validationThreshold, setValidationThreshold] = useState(DEFAULT_THRESHOLD);
+  const espaceId = currentEspace?.id;
+  const isAdmin = role === "admin";
+  const seesAll = role === "admin" || role === "superviseur";
 
-  const DEFAULT_CATEGORIES: Category[] = [
-    { id: 1, nom: "autre", couleur: "#64748b", icone: "Tag", ordre: 1, active: true },
-    { id: 2, nom: "sakafo", couleur: "#10b981", icone: "Utensils", ordre: 2, active: true },
-    { id: 3, nom: "transport", couleur: "#3b82c6", icone: "Car", ordre: 3, active: true },
-    { id: 4, nom: "loyer", couleur: "#f59e0b", icone: "Home", ordre: 4, active: true },
-    { id: 5, nom: "salaire", couleur: "#22c55e", icone: "Wallet", ordre: 5, active: true },
-    { id: 6, nom: "fournitures", couleur: "#8b5cf6", icone: "Package", ordre: 6, active: true },
-  ];
-
-  const loadCategories = useCallback(async () => {
-    try {
-      const cats = await db.categories.where("active").equals(1 as unknown as boolean).toArray();
-      if (cats && cats.length > 0) {
-        setCategories(cats.map(c => ({ ...c, id: c.id!, user_id: null })));
-      } else {
-        const allCats = await db.categories.toArray();
-        if (allCats.length > 0) {
-          setCategories(allCats.map(c => ({ ...c, id: c.id!, user_id: null })));
-        } else {
-          setCategories(DEFAULT_CATEGORIES);
-        }
-      }
-    } catch {
-      setCategories(DEFAULT_CATEGORIES);
+  const load = useCallback(async () => {
+    if (!espaceId || !profile) {
+      setTransactions([]);
+      setLoading(false);
+      return;
     }
-  }, []);
-
-  const loadThreshold = useCallback(async () => {
-    try {
-      if (!currentEspace) return;
-      const setting = await db.settings
-        .where("espace_id")
-        .equals(currentEspace.id)
-        .toArray();
-      const seuil = setting.find(s => s.cle === "seuil_validation");
-      if (seuil?.valeur) setValidationThreshold(Number(seuil.valeur));
-    } catch {
-      // keep default
-    }
-  }, [currentEspace]);
-
-  const loadProfiles = useCallback(async () => {
-    try {
-      const users = await db.users.toArray();
-      const map: ProfileMap = {};
-      for (const u of users) map[u.id] = u.nom;
-      profileMapRef.current = map;
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  const loadLocal = useCallback(async () => {
-    const espaceId = currentEspace?.id;
-    const rows = await db.transactions.toArray();
-    const pm = profileMapRef.current;
-    const display: DisplayTransaction[] = rows
-      .filter((r) => !r.supprime && (!espaceId || r.espace_id === espaceId))
-      .map((r: LocalTransaction) => ({
-        id: r.client_uuid,
-        client_uuid: r.client_uuid,
-        date_transaction: r.date_transaction,
-        motif: r.motif,
-        type_operation: r.type_operation,
-        montant: r.montant,
-        categorie: r.categorie,
-        statut: r.statut,
-        auteur_nom: pm[r.auteur_id],
-        cree_le: r.cree_le,
-        modifie_le: r.modifie_le ?? null,
-        supprime: r.supprime,
-        synced: true,
-        auteur_id: r.auteur_id,
-        espace_id: r.espace_id,
-      }))
-      .sort((a, b) => (b.date_transaction + b.cree_le).localeCompare(a.date_transaction + a.cree_le));
-    setTransactions(display);
-  }, [currentEspace]);
+    const [rows, users, cats, seuil] = await Promise.all([
+      db.transactions.where("espace_id").equals(espaceId).toArray(),
+      db.users.toArray(),
+      db.categories.orderBy("ordre").toArray(),
+      db.settings.where("[espace_id+cle]").equals([espaceId, "seuil_validation"]).first(),
+    ]);
+    const names = new Map(users.map((u) => [u.id, u.nom]));
+    setTransactions(
+      rows
+        .filter((r) => !r.supprime && (seesAll || r.auteur_id === profile.id))
+        .map((r: LocalTransaction) => ({
+          id: r.client_uuid,
+          client_uuid: r.client_uuid,
+          date_transaction: r.date_transaction,
+          motif: r.motif,
+          type_operation: r.type_operation,
+          montant: r.montant,
+          categorie: r.categorie,
+          statut: r.statut,
+          auteur_nom: names.get(r.auteur_id),
+          cree_le: r.cree_le,
+          modifie_le: r.modifie_le ?? null,
+          supprime: r.supprime,
+          synced: !r.dirty,
+          auteur_id: r.auteur_id,
+          espace_id: r.espace_id,
+        }))
+        .sort((a, b) => (b.date_transaction + b.cree_le).localeCompare(a.date_transaction + a.cree_le)),
+    );
+    setCategories(
+      cats.filter((c) => c.active && !c.deleted).map((c) => ({ id: c.id!, nom: c.nom, couleur: c.couleur, icone: c.icone, ordre: c.ordre, active: c.active, user_id: c.user_id ?? null })),
+    );
+    const n = Number(seuil?.valeur);
+    setValidationThreshold(Number.isFinite(n) && n > 0 ? n : DEFAULT_THRESHOLD);
+    setLoading(false);
+  }, [espaceId, profile, seesAll]);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      await ensureSeedData();
-      await deduplicateLocalDb();
-      await Promise.all([loadCategories(), loadProfiles(), loadThreshold()]);
-      if (!cancelled) {
-        await loadLocal();
-        setLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    load().catch((err) => {
+      console.error("[transactions] chargement", err);
+      setLoading(false);
+    });
+  }, [load, version]);
 
+  // Récurrences dues : à l'ouverture et quand l'espace change.
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      await loadThreshold();
-      if (!cancelled) await loadLocal();
-    })();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentEspace?.id]);
-
-  useEffect(() => {
-    const onReload = async () => {
-      await loadLocal();
-    };
-    window.addEventListener("mtantana:reload-transactions", onReload);
-    return () => window.removeEventListener("mtantana:reload-transactions", onReload);
-  }, [loadLocal]);
+    if (espaceId && profile) generateDueRecurring(espaceId, profile.id).catch(() => undefined);
+  }, [espaceId, profile]);
 
   const createTransaction = useCallback(
     async (data: TransactionFormData) => {
-      if (!profile) throw new Error("No profile");
-      const now = new Date().toISOString();
-      const isAdmin = profile.role === "admin";
-      const statut: "validee" | "en_attente_validation" =
-        data.montant >= validationThreshold && !isAdmin ? "en_attente_validation" : "validee";
-
-      await db.transactions.add({
-        client_uuid: data.client_uuid,
+      if (!profile || !espaceId) throw new Error("Aucun espace sélectionné");
+      const statut: LocalTransaction["statut"] = data.montant >= validationThreshold && !isAdmin ? "en_attente_validation" : "validee";
+      const row: LocalTransaction = {
+        client_uuid: data.client_uuid || genClientUuid(),
         date_transaction: data.date_transaction,
-        motif: data.motif,
+        motif: data.motif.trim().slice(0, 255),
         type_operation: data.type_operation,
         montant: data.montant,
         categorie: data.categorie,
         statut,
         auteur_id: profile.id,
-        cree_le: now,
+        cree_le: nowISO(),
         modifie_le: null,
         supprime: false,
-        espace_id: currentEspace?.id,
-      });
-
-      if (currentEspace?.id && navigator.onLine) {
-        await supabase.from("transactions").insert({
-          client_uuid: data.client_uuid,
-          date_transaction: data.date_transaction,
-          motif: data.motif,
-          type_operation: data.type_operation,
-          montant: data.montant,
-          categorie: data.categorie,
-          statut,
-          auteur_id: profile.id,
-          cree_le: now,
-          modifie_le: null,
-          supprime: false,
-          espace_id: currentEspace.id,
-        });
-      }
-
-      await addAuditEntry("creation", "transactions", data.client_uuid, null, JSON.stringify(data), profile.id, currentEspace?.id);
-      await loadLocal();
+        espace_id: espaceId,
+        dirty: dirtyFlag(),
+      };
+      await db.transactions.add(row);
+      await addLocalAudit("creation", row.client_uuid, null, data, profile.id, espaceId);
+      notifyDataChanged();
     },
-    [profile, validationThreshold, currentEspace, loadLocal]
+    [profile, espaceId, validationThreshold, isAdmin],
   );
 
   const updateTransaction = useCallback(
     async (clientUuid: string, data: TransactionFormData) => {
-      if (!profile) throw new Error("No profile");
+      if (!profile || !espaceId) return;
       const local = await db.transactions.where("client_uuid").equals(clientUuid).first();
       if (!local?.id) return;
-      const now = new Date().toISOString();
-      const oldData = JSON.stringify(local);
-      await db.transactions.update(local.id, {
+      // Seuls l'admin et l'auteur modifient (règle aussi appliquée par la base).
+      if (!isAdmin && local.auteur_id !== profile.id) throw new Error("Lecture seule : vous ne pouvez modifier que vos propres saisies");
+      const changes: Partial<LocalTransaction> = {
         date_transaction: data.date_transaction,
-        motif: data.motif,
+        motif: data.motif.trim().slice(0, 255),
         type_operation: data.type_operation,
         montant: data.montant,
         categorie: data.categorie,
-        modifie_le: now,
-      });
-
-      if (navigator.onLine) {
-        await supabase
-          .from("transactions")
-          .update({
-            date_transaction: data.date_transaction,
-            motif: data.motif,
-            type_operation: data.type_operation,
-            montant: data.montant,
-            categorie: data.categorie,
-            modifie_le: now,
-          })
-          .eq("client_uuid", clientUuid);
-      }
-
-      await addAuditEntry("modification", "transactions", clientUuid, oldData, JSON.stringify(data), profile.id, currentEspace?.id);
-      await loadLocal();
+        modifie_le: nowISO(),
+        dirty: dirtyFlag(),
+      };
+      if (!isAdmin && data.montant >= validationThreshold) changes.statut = "en_attente_validation";
+      await db.transactions.update(local.id, changes);
+      await addLocalAudit("modification", clientUuid, local, data, profile.id, espaceId);
+      notifyDataChanged();
     },
-    [profile, loadLocal, currentEspace]
+    [profile, espaceId, isAdmin, validationThreshold],
   );
 
   const deleteTransaction = useCallback(
     async (clientUuid: string) => {
+      if (!profile || !espaceId) return;
       const local = await db.transactions.where("client_uuid").equals(clientUuid).first();
       if (!local?.id) return;
-      const now = new Date().toISOString();
-      await db.transactions.update(local.id, { supprime: true, modifie_le: now });
-
-      if (navigator.onLine) {
-        await supabase
-          .from("transactions")
-          .update({ supprime: true, modifie_le: now })
-          .eq("client_uuid", clientUuid);
-      }
-
-      if (profile) {
-        await addAuditEntry("suppression", "transactions", clientUuid, JSON.stringify(local), null, profile.id, currentEspace?.id);
-      }
-      await loadLocal();
+      if (!isAdmin && local.auteur_id !== profile.id) throw new Error("Lecture seule : vous ne pouvez supprimer que vos propres saisies");
+      await db.transactions.update(local.id, { supprime: true, modifie_le: nowISO(), dirty: dirtyFlag() });
+      await addLocalAudit("suppression", clientUuid, local, null, profile.id, espaceId);
+      notifyDataChanged();
     },
-    [profile, loadLocal, currentEspace]
+    [profile, espaceId, isAdmin],
   );
 
   const validateTransaction = useCallback(
     async (clientUuid: string) => {
+      if (!profile || !espaceId || !isAdmin) return;
       const local = await db.transactions.where("client_uuid").equals(clientUuid).first();
       if (!local?.id) return;
-      await db.transactions.update(local.id, { statut: "validee" });
-
-      if (navigator.onLine) {
-        await supabase
-          .from("transactions")
-          .update({ statut: "validee" })
-          .eq("client_uuid", clientUuid);
-      }
-
-      if (profile) {
-        await addAuditEntry("validation", "transactions", clientUuid, local.statut, "validee", profile.id, currentEspace?.id);
-      }
-      await loadLocal();
+      await db.transactions.update(local.id, { statut: "validee", modifie_le: nowISO(), dirty: dirtyFlag() });
+      await addLocalAudit("validation", clientUuid, local.statut, "validee", profile.id, espaceId);
+      notifyDataChanged();
     },
-    [profile, loadLocal, currentEspace]
+    [profile, espaceId, isAdmin],
   );
 
   return {
@@ -292,28 +271,7 @@ export function useTransactions() {
     updateTransaction,
     deleteTransaction,
     validateTransaction,
-    reload: loadLocal,
+    reload: load,
     genClientUuid,
   };
-}
-
-async function addAuditEntry(
-  action: string,
-  table: string,
-  recordId: string,
-  oldValue: string | null,
-  newValue: string | null,
-  authorId: string,
-  espaceId?: string,
-) {
-  await db.journal_audit.add({
-    action,
-    table_concernee: table,
-    enregistrement_id: recordId,
-    ancienne_valeur: oldValue,
-    nouvelle_valeur: newValue,
-    auteur_id: authorId,
-    date_action: new Date().toISOString(),
-    espace_id: espaceId ?? "",
-  });
 }
